@@ -104,9 +104,20 @@ func PrintListItem(icon, name string) {
 }
 
 func PrintDivider() {
+	PrintDividerWidth(41)
+}
+
+func PrintDividerWidth(width int) {
+	if width < 1 {
+		width = 41
+	}
+	dividerStr := ""
+	for i := 0; i < width; i++ {
+		dividerStr += "─"
+	}
 	divider := lipgloss.NewStyle().
 		Foreground(primaryColor).
-		Render("─────────────────────────────────────────")
+		Render(dividerStr)
 	fmt.Println(divider)
 }
 

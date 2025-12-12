@@ -74,11 +74,31 @@ func RecordFailedAttempt() error {
 
 	rl.FailedAttempts++
 
-	if rl.FailedAttempts >= 10 {
-		rl.LockedUntil = time.Now().Add(5 * time.Minute)
+	if rl.FailedAttempts >= 3 {
+		lockoutDuration := calculateLockoutDuration(rl.FailedAttempts)
+		rl.LockedUntil = time.Now().Add(lockoutDuration)
 	}
 
 	return SaveRateLimit(rl)
+}
+
+func calculateLockoutDuration(attempts int) time.Duration {
+	switch {
+	case attempts >= 20:
+		return 24 * time.Hour
+	case attempts >= 15:
+		return 2 * time.Hour
+	case attempts >= 10:
+		return 30 * time.Minute
+	case attempts >= 7:
+		return 10 * time.Minute
+	case attempts >= 5:
+		return 3 * time.Minute
+	case attempts >= 3:
+		return 1 * time.Minute
+	default:
+		return 0
+	}
 }
 
 func ResetRateLimit() error {

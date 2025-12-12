@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/atotto/clipboard"
@@ -20,6 +21,7 @@ import (
 )
 
 var useGroupVault bool
+var currentUsername string = "default"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -291,6 +293,7 @@ func secretsInit(useGroups bool) error {
 	if err != nil {
 		return fmt.Errorf("could not read user passphrase: %w", err)
 	}
+	defer crypto.CleanupBytes(userPass)
 
 	masterKey, err := crypto.GenerateMasterKey()
 	if err != nil {
@@ -322,6 +325,36 @@ func secretsInit(useGroups bool) error {
 	return nil
 }
 
+func promptForUsername() error {
+	if !useGroupVault {
+		return nil
+	}
+
+	isMultiUser, err := multiuser.IsMultiUserMode()
+	if err != nil {
+		return fmt.Errorf("failed to check vault mode: %w", err)
+	}
+	if !isMultiUser {
+		return nil
+	}
+
+	ui.PrintPrompt("enter your username: ")
+	fmt.Scanln(&currentUsername)
+
+	password, err := crypto.ReadUserPass()
+	if err != nil {
+		return fmt.Errorf("failed to read password: %w", err)
+	}
+	defer crypto.CleanupBytes(password)
+
+	_, err = multiuser.GetMasterKeyForUser(currentUsername, password)
+	if err != nil {
+		return fmt.Errorf("authentication failed: %w", err)
+	}
+
+	return nil
+}
+
 func secretsAdd() error {
 	ui.PrintTitle("adding secret")
 	fmt.Println()
@@ -338,6 +371,13 @@ func secretsAdd() error {
 		return fmt.Errorf("no secret in clipboard")
 	}
 
+	const maxSecretSize = 1024 * 1024
+	if len(secretValue) > maxSecretSize {
+		ui.PrintError("x", fmt.Sprintf("secret too large (max %d bytes, got %d bytes)", maxSecretSize, len(secretValue)))
+		fmt.Println()
+		return fmt.Errorf("secret exceeds maximum size")
+	}
+
 	ui.PrintSuccess("+", "secret loaded from clipboard")
 	fmt.Println()
 
@@ -345,6 +385,7 @@ func secretsAdd() error {
 	if err != nil {
 		return fmt.Errorf("failed to read password")
 	}
+	defer crypto.CleanupBytes(password)
 	encryptedMasterKey, salt, err := keyring.LoadEncryptedMasterKey()
 	if err != nil {
 		return fmt.Errorf("failed to load encrypted master key from vault")
@@ -360,7 +401,6 @@ func secretsAdd() error {
 		storage.RecordFailedAttempt()
 		return fmt.Errorf("failed to decrypt master key - incorrect password")
 	}
-	crypto.SecureBytes(masterKey)
 	defer crypto.CleanupBytes(masterKey)
 
 	storage.ResetRateLimit()
@@ -377,8 +417,23 @@ func secretsAdd() error {
 	if err != nil {
 		return fmt.Errorf("failed to read secret name")
 	}
+
+	// Check access control for multi-user mode
+	if useGroupVault {
+		if err := promptForUsername(); err != nil {
+			return err
+		}
+		canAccess, err := multiuser.UserCanAccessSecret(currentUsername, secretName)
+		if err != nil {
+			return fmt.Errorf("failed to check access: %w", err)
+		}
+		if !canAccess {
+			return fmt.Errorf("access denied: user '%s' does not have permission to add secrets with prefix '%s'", currentUsername, secretName)
+		}
+	}
+
 	if err := storage.AddSecretWithMode(secretName, encryptedSecret, useGroupVault); err != nil {
-		audit.LogEvent("default", "add", secretName, false, err.Error(), masterKey)
+		audit.LogEvent(currentUsername, "add", secretName, false, err.Error(), masterKey)
 		return fmt.Errorf("failed to store secret in vault")
 	}
 
@@ -388,7 +443,7 @@ func secretsAdd() error {
 		ui.PrintWarning("!", fmt.Sprintf("warning: auto-backup failed: %v", err))
 	}
 
-	audit.LogEvent("default", "add", secretName, true, "", masterKey)
+	audit.LogEvent(currentUsername, "add", secretName, true, "", masterKey)
 
 	fmt.Println()
 	ui.PrintSuccess("+", fmt.Sprintf("secret '%s' added successfully!", secretName))
@@ -399,6 +454,14 @@ func secretsAdd() error {
 	fmt.Println()
 	return nil
 }
+
+type clipboardClearToken struct {
+	token string
+	value string
+}
+
+var activeClipboardToken *clipboardClearToken
+var clipboardMutex sync.Mutex
 
 func secretsGet(secretName string, useClipboard bool) error {
 	ui.PrintTitle("retrieving secret")
@@ -414,6 +477,7 @@ func secretsGet(secretName string, useClipboard bool) error {
 	if err != nil {
 		return fmt.Errorf("failed to read password: %w", err)
 	}
+	defer crypto.CleanupBytes(password)
 
 	// Load and decrypt master key
 	encryptedMasterKey, salt, err := keyring.LoadEncryptedMasterKey()
@@ -432,10 +496,23 @@ func secretsGet(secretName string, useClipboard bool) error {
 		storage.RecordFailedAttempt()
 		return fmt.Errorf("failed to decrypt master key - incorrect password")
 	}
-	crypto.SecureBytes(masterKey)
 	defer crypto.CleanupBytes(masterKey)
 
 	storage.ResetRateLimit()
+
+	// Check access control for multi-user mode
+	if useGroupVault {
+		if err := promptForUsername(); err != nil {
+			return err
+		}
+		canAccess, err := multiuser.UserCanAccessSecret(currentUsername, secretName)
+		if err != nil {
+			return fmt.Errorf("failed to check access: %w", err)
+		}
+		if !canAccess {
+			return fmt.Errorf("access denied: user '%s' does not have permission to access secret '%s'", currentUsername, secretName)
+		}
+	}
 
 	// Get encrypted secret from vault
 	encryptedSecret, err := storage.GetSecretWithMode(secretName, useGroupVault)
@@ -446,13 +523,13 @@ func secretsGet(secretName string, useClipboard bool) error {
 	// Decrypt the secret
 	secret, err := crypto.DecryptSecret(encryptedSecret, masterKey)
 	if err != nil {
-		audit.LogEvent("default", "get", secretName, false, err.Error(), masterKey)
+		audit.LogEvent(currentUsername, "get", secretName, false, err.Error(), masterKey)
 		return fmt.Errorf("failed to decrypt secret: %w", err)
 	}
 	crypto.SecureBytes(secret)
 	defer crypto.CleanupBytes(secret)
 
-	audit.LogEvent("default", "get", secretName, true, "", masterKey)
+	audit.LogEvent(currentUsername, "get", secretName, true, "", masterKey)
 
 	fmt.Println()
 
@@ -465,20 +542,36 @@ func secretsGet(secretName string, useClipboard bool) error {
 		ui.PrintMuted("  clipboard will be cleared in 30 seconds...")
 		fmt.Println()
 
-		go func() {
+		token := fmt.Sprintf("%d", time.Now().UnixNano())
+		clipboardMutex.Lock()
+		activeClipboardToken = &clipboardClearToken{
+			token: token,
+			value: secretStr,
+		}
+		clipboardMutex.Unlock()
+
+		go func(clearToken string) {
 			time.Sleep(30 * time.Second)
-			current, err := clipboard.ReadAll()
-			if err == nil && current == secretStr {
+			clipboardMutex.Lock()
+			defer clipboardMutex.Unlock()
+			if activeClipboardToken != nil && activeClipboardToken.token == clearToken {
 				clipboard.WriteAll("")
+				activeClipboardToken = nil
 			}
-		}()
+		}(token)
 	} else {
-		ui.PrintMuted("  use --clip flag to copy to clipboard instead")
+		ui.PrintWarning("!", "WARNING: Secrets printed to terminal may be logged by your shell or terminal emulator")
+		ui.PrintMuted("  use --clip flag to copy to clipboard instead (recommended)")
 		fmt.Println()
-		ui.PrintDivider()
-		fmt.Println(ui.SuccessStyle.Render(strings.TrimRight(string(secret), "\n\r")))
+		secretStr := strings.TrimRight(string(secret), "\n\r")
+		secretLen := len(secretStr)
+		if secretLen < 20 {
+			secretLen = 20
+		}
+		ui.PrintDividerWidth(secretLen)
+		fmt.Println(ui.SuccessStyle.Render(secretStr))
 		fmt.Println()
-		ui.PrintDivider()
+		ui.PrintDividerWidth(secretLen)
 		fmt.Println()
 	}
 
@@ -523,7 +616,7 @@ func secretsDelete(secretName string) error {
 	if err != nil {
 		return fmt.Errorf("failed to read password: %w", err)
 	}
-
+	defer crypto.CleanupBytes(password)
 	encryptedMasterKey, salt, err := keyring.LoadEncryptedMasterKey()
 	if err != nil {
 		return fmt.Errorf("failed to load encrypted master key: %w", err)
@@ -540,12 +633,26 @@ func secretsDelete(secretName string) error {
 		storage.RecordFailedAttempt()
 		return fmt.Errorf("failed to decrypt master key - incorrect password")
 	}
-	crypto.CleanupBytes(masterKey)
+	defer crypto.CleanupBytes(masterKey)
 
 	storage.ResetRateLimit()
 
+	// Check access control for multi-user mode
+	if useGroupVault {
+		if err := promptForUsername(); err != nil {
+			return err
+		}
+		canAccess, err := multiuser.UserCanAccessSecret(currentUsername, secretName)
+		if err != nil {
+			return fmt.Errorf("failed to check access: %w", err)
+		}
+		if !canAccess {
+			return fmt.Errorf("access denied: user '%s' does not have permission to delete secret '%s'", currentUsername, secretName)
+		}
+	}
+
 	if err := storage.DeleteSecretWithMode(secretName, useGroupVault); err != nil {
-		audit.LogEvent("default", "delete", secretName, false, err.Error(), masterKey)
+		audit.LogEvent(currentUsername, "delete", secretName, false, err.Error(), masterKey)
 		return fmt.Errorf("failed to delete secret: %w", err)
 	}
 
@@ -553,7 +660,7 @@ func secretsDelete(secretName string) error {
 		ui.PrintWarning("!", fmt.Sprintf("warning: auto-backup failed: %v", err))
 	}
 
-	audit.LogEvent("default", "delete", secretName, true, "", masterKey)
+	audit.LogEvent(currentUsername, "delete", secretName, true, "", masterKey)
 
 	ui.PrintSuccess("+", fmt.Sprintf("secret '%s' deleted successfully", secretName))
 	fmt.Println()
@@ -572,7 +679,7 @@ func secretsEnvRun(cmdArgs []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to read password: %w", err)
 	}
-
+	defer crypto.CleanupBytes(password)
 	encryptedMasterKey, salt, err := keyring.LoadEncryptedMasterKey()
 	if err != nil {
 		return fmt.Errorf("failed to load encrypted master key: %w", err)
@@ -589,7 +696,6 @@ func secretsEnvRun(cmdArgs []string) error {
 		storage.RecordFailedAttempt()
 		return fmt.Errorf("failed to decrypt master key - incorrect password")
 	}
-	crypto.SecureBytes(masterKey)
 	defer crypto.CleanupBytes(masterKey)
 
 	storage.ResetRateLimit()
@@ -663,7 +769,7 @@ func secretsExport(outputFile string) error {
 	if err != nil {
 		return fmt.Errorf("failed to read password: %w", err)
 	}
-
+	defer crypto.CleanupBytes(password)
 	encryptedMasterKey, salt, err := keyring.LoadEncryptedMasterKey()
 	if err != nil {
 		return fmt.Errorf("failed to load encrypted master key: %w", err)
@@ -720,6 +826,7 @@ func secretsImport(inputFile string) error {
 	if err != nil {
 		return fmt.Errorf("failed to read password: %w", err)
 	}
+	defer crypto.CleanupBytes(password)
 
 	ui.PrintInfo(">", "decrypting backup...")
 	fmt.Println()
@@ -768,7 +875,7 @@ func secretsBackup() error {
 	if err != nil {
 		return fmt.Errorf("failed to read password: %w", err)
 	}
-
+	defer crypto.CleanupBytes(password)
 	encryptedMasterKey, salt, err := keyring.LoadEncryptedMasterKey()
 	if err != nil {
 		return fmt.Errorf("failed to load encrypted master key: %w", err)
@@ -817,18 +924,31 @@ func secretsInitMultiUser() error {
 	if err != nil {
 		return fmt.Errorf("could not read user passphrase: %w", err)
 	}
+	defer crypto.CleanupBytes(userPass)
 
 	fmt.Println()
 	ui.PrintPrompt("enter initial group name (e.g., admins, devs): ")
 	var groupName string
 	fmt.Scanln(&groupName)
 
-	ui.PrintPrompt("enter secret prefixes for this group (comma-separated, e.g., DB_,API_): ")
-	var prefixesInput string
-	fmt.Scanln(&prefixesInput)
-	prefixes := strings.Split(prefixesInput, ",")
-	for i := range prefixes {
-		prefixes[i] = strings.TrimSpace(prefixes[i])
+	var prefixes []string
+	for {
+		ui.PrintPrompt("enter secret prefixes for this group (comma-separated, e.g., DB_,API_): ")
+		var prefixesInput string
+		fmt.Scanln(&prefixesInput)
+
+		if strings.Contains(prefixesInput, ", ") {
+			ui.PrintError("x", "invalid format: spaces detected after commas")
+			ui.PrintMuted("  use format: DB_,API_ (no spaces after commas)")
+			fmt.Println()
+			continue
+		}
+
+		prefixes = strings.Split(prefixesInput, ",")
+		for i := range prefixes {
+			prefixes[i] = strings.TrimSpace(prefixes[i])
+		}
+		break
 	}
 
 	masterKey, err := crypto.GenerateMasterKey()
@@ -918,6 +1038,7 @@ func userAdd() error {
 	if err != nil {
 		return fmt.Errorf("failed to read admin password: %w", err)
 	}
+	defer crypto.CleanupBytes(adminPassword)
 
 	masterKey, err := multiuser.GetMasterKeyForUser(adminUsername, adminPassword)
 	if err != nil {
@@ -934,6 +1055,7 @@ func userAdd() error {
 	if err != nil {
 		return fmt.Errorf("failed to read new user password: %w", err)
 	}
+	defer crypto.CleanupBytes(newPassword)
 
 	if err := multiuser.AddUserToVault(newUsername, newPassword, masterKey); err != nil {
 		return fmt.Errorf("failed to add user: %w", err)
@@ -1009,12 +1131,24 @@ func groupCreate() error {
 		users[i] = strings.TrimSpace(users[i])
 	}
 
-	ui.PrintPrompt("enter secret prefixes (comma-separated, e.g., DB_,API_): ")
-	var prefixesInput string
-	fmt.Scanln(&prefixesInput)
-	prefixes := strings.Split(prefixesInput, ",")
-	for i := range prefixes {
-		prefixes[i] = strings.TrimSpace(prefixes[i])
+	var prefixes []string
+	for {
+		ui.PrintPrompt("enter secret prefixes (comma-separated, e.g., DB_,API_): ")
+		var prefixesInput string
+		fmt.Scanln(&prefixesInput)
+
+		if strings.Contains(prefixesInput, ", ") {
+			ui.PrintError("x", "invalid format: spaces detected after commas")
+			ui.PrintMuted("  use format: DB_,API_ (no spaces after commas)")
+			fmt.Println()
+			continue
+		}
+
+		prefixes = strings.Split(prefixesInput, ",")
+		for i := range prefixes {
+			prefixes[i] = strings.TrimSpace(prefixes[i])
+		}
+		break
 	}
 
 	if err := multiuser.CreateGroup(groupName, users, prefixes); err != nil {
@@ -1080,7 +1214,7 @@ func secretsHistory() error {
 	if err != nil {
 		return fmt.Errorf("failed to read password: %w", err)
 	}
-
+	defer crypto.CleanupBytes(password)
 	encryptedMasterKey, salt, err := keyring.LoadEncryptedMasterKey()
 	if err != nil {
 		return fmt.Errorf("failed to load encrypted master key: %w", err)
@@ -1097,7 +1231,6 @@ func secretsHistory() error {
 		storage.RecordFailedAttempt()
 		return fmt.Errorf("failed to decrypt master key - incorrect password")
 	}
-	crypto.SecureBytes(masterKey)
 	defer crypto.CleanupBytes(masterKey)
 
 	storage.ResetRateLimit()

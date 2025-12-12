@@ -1,6 +1,8 @@
 package multiuser
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -63,6 +65,13 @@ func LoadMultiUserVault(path string) (*MultiUserVault, error) {
 		vault.Mode = "single-user"
 	}
 
+	if vault.HMAC != "" {
+		expectedHMAC := computeMultiUserVaultHMAC(&vault)
+		if vault.HMAC != expectedHMAC {
+			return nil, fmt.Errorf("vault integrity check failed - possible tampering detected")
+		}
+	}
+
 	return &vault, nil
 }
 
@@ -87,10 +96,54 @@ func SaveMultiUserVault(path string, vault *MultiUserVault) error {
 }
 
 func computeMultiUserVaultHMAC(vault *MultiUserVault) string {
-	return ""
+	key := sha256.Sum256([]byte("vault-integrity-key-" + vault.VaultID))
+	h := hmac.New(sha256.New, key[:])
+
+	// Hash secrets
+	names := make([]string, 0, len(vault.Secrets))
+	for name := range vault.Secrets {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		h.Write([]byte(name))
+		h.Write([]byte(vault.Secrets[name]))
+	}
+
+	// Hash user shares
+	users := make([]string, 0, len(vault.MasterKeyShare))
+	for user := range vault.MasterKeyShare {
+		users = append(users, user)
+	}
+	sort.Strings(users)
+	for _, user := range users {
+		share := vault.MasterKeyShare[user]
+		h.Write([]byte(user))
+		h.Write([]byte(share.EncryptedShare))
+		h.Write([]byte(share.Salt))
+	}
+
+	// Hash groups
+	groupNames := make([]string, 0, len(vault.Groups))
+	for groupName := range vault.Groups {
+		groupNames = append(groupNames, groupName)
+	}
+	sort.Strings(groupNames)
+	for _, groupName := range groupNames {
+		group := vault.Groups[groupName]
+		h.Write([]byte(group.Name))
+		for _, user := range group.Users {
+			h.Write([]byte(user))
+		}
+		for _, prefix := range group.SecretPrefix {
+			h.Write([]byte(prefix))
+		}
+	}
+
+	return hex.EncodeToString(h.Sum(nil))
 }
 
-func InitMultiUserVault(username string, password string, masterKey []byte) error {
+func InitMultiUserVault(username string, password []byte, masterKey []byte) error {
 	vaultPath := GetMultiUserVaultPath()
 
 	derivedKey, salt, err := crypto.DeriveKeyFromUserPass([]byte(password), nil)
@@ -126,7 +179,7 @@ func InitMultiUserVault(username string, password string, masterKey []byte) erro
 	return nil
 }
 
-func AddUserToVault(username string, password string, masterKey []byte) error {
+func AddUserToVault(username string, password []byte, masterKey []byte) error {
 	vaultPath := GetMultiUserVaultPath()
 	vault, err := LoadMultiUserVault(vaultPath)
 	if err != nil {
@@ -165,7 +218,7 @@ func AddUserToVault(username string, password string, masterKey []byte) error {
 	return nil
 }
 
-func GetMasterKeyForUser(username string, password string) ([]byte, error) {
+func GetMasterKeyForUser(username string, password []byte) ([]byte, error) {
 	vaultPath := GetMultiUserVaultPath()
 	vault, err := LoadMultiUserVault(vaultPath)
 	if err != nil {

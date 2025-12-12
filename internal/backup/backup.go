@@ -23,7 +23,7 @@ type ExportBlob struct {
 	Encrypted  bool              `json:"encrypted"`
 }
 
-func ExportSecrets(password string) ([]byte, error) {
+func ExportSecrets(password []byte) ([]byte, error) {
 	vault, err := storage.LoadVault(storage.GetVaultPath())
 	if err != nil {
 		return nil, fmt.Errorf("failed to load vault: %w", err)
@@ -67,7 +67,7 @@ func ExportSecrets(password string) ([]byte, error) {
 	return wrapperJSON, nil
 }
 
-func ImportSecrets(encryptedBlob []byte, password string) (*ExportBlob, error) {
+func ImportSecrets(encryptedBlob []byte, password []byte) (*ExportBlob, error) {
 	var wrapper map[string]string
 	if err := json.Unmarshal(encryptedBlob, &wrapper); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal wrapper: %w", err)
@@ -125,7 +125,7 @@ func GetBackupDir() string {
 	return filepath.Join(vaultDir, "backups")
 }
 
-func CreateAutoBackup(password string) error {
+func CreateAutoBackup(password []byte) error {
 	backupDir := GetBackupDir()
 	if err := os.MkdirAll(backupDir, 0700); err != nil {
 		return fmt.Errorf("failed to create backup directory: %w", err)

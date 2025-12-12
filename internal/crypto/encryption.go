@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
+	"hash"
 	"io"
 	"log"
 	"os"
@@ -35,31 +37,30 @@ func ValidatePasswordStrength(password string) error {
 	return nil
 }
 
-func ReadUserPass() (password string, err error) {
+func ReadUserPass() ([]byte, error) {
 	ui.PrintPrompt("enter password: ")
-	bytePassword, err := term.ReadPassword(int(syscall.Stdin))
+	password, err := term.ReadPassword(int(syscall.Stdin))
 	fmt.Println()
 	if err != nil {
 		log.Println("passphrase could not be read")
-		return
+		return nil, err
 	}
-	password = string(bytePassword)
 	return password, nil
 }
 
-func ReadUserPassWithValidation() (password string, err error) {
+func ReadUserPassWithValidation() ([]byte, error) {
 	for {
 		ui.PrintPrompt("enter password (min 12 chars): ")
-		bytePassword, err := term.ReadPassword(int(syscall.Stdin))
+		password, err := term.ReadPassword(int(syscall.Stdin))
 		fmt.Println()
 		if err != nil {
 			log.Println("passphrase could not be read")
-			return "", err
+			return nil, err
 		}
-		password = string(bytePassword)
-		if err := ValidatePasswordStrength(password); err != nil {
+		if err := ValidatePasswordStrength(string(password)); err != nil {
 			ui.PrintError("x", err.Error())
 			fmt.Println()
+			CleanupBytes(password)
 			continue
 		}
 		return password, nil
@@ -239,13 +240,18 @@ func SecureBytes(data []byte) {
 	if len(data) == 0 {
 		return
 	}
+	lockMutex.Lock()
+	defer lockMutex.Unlock()
+
+	if lockedMemory[&data[0]] {
+		return
+	}
+
 	if err := LockMemory(data); err != nil {
 		log.Printf("warning: could not lock memory: %v", err)
 		return
 	}
-	lockMutex.Lock()
 	lockedMemory[&data[0]] = true
-	lockMutex.Unlock()
 }
 
 func CleanupBytes(data []byte) {
@@ -256,7 +262,9 @@ func CleanupBytes(data []byte) {
 
 	lockMutex.Lock()
 	wasLocked := lockedMemory[&data[0]]
-	delete(lockedMemory, &data[0])
+	if wasLocked {
+		delete(lockedMemory, &data[0])
+	}
 	lockMutex.Unlock()
 
 	if wasLocked {
@@ -264,4 +272,8 @@ func CleanupBytes(data []byte) {
 			log.Printf("warning: could not unlock memory: %v", err)
 		}
 	}
+}
+
+func NewHMAC(key []byte) hash.Hash {
+	return hmac.New(sha256.New, key)
 }

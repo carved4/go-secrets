@@ -25,7 +25,8 @@ type AuditEvent struct {
 }
 
 type AuditLog struct {
-	Events []string `json:"events"`
+	Events   []string `json:"events"`
+	Checksum string   `json:"checksum"`
 }
 
 func GetAuditLogPath() string {
@@ -88,6 +89,8 @@ func LogEvent(user string, action string, secret string, success bool, errorMsg 
 		auditLog.Events = auditLog.Events[len(auditLog.Events)-10000:]
 	}
 
+	auditLog.Checksum = computeAuditLogChecksum(auditLog.Events, masterKey)
+
 	if err := saveAuditLog(auditLogPath, auditLog); err != nil {
 		return fmt.Errorf("failed to save audit log: %w", err)
 	}
@@ -109,6 +112,36 @@ func loadAuditLog(path string) (*AuditLog, error) {
 	return &auditLog, nil
 }
 
+func VerifyAuditLogIntegrity(masterKey []byte) error {
+	auditLogPath := GetAuditLogPath()
+	auditLog, err := loadAuditLog(auditLogPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to load audit log: %w", err)
+	}
+
+	if auditLog.Checksum == "" {
+		return nil
+	}
+
+	expectedChecksum := computeAuditLogChecksum(auditLog.Events, masterKey)
+	if auditLog.Checksum != expectedChecksum {
+		return fmt.Errorf("audit log integrity check failed - possible tampering detected")
+	}
+
+	return nil
+}
+
+func computeAuditLogChecksum(events []string, masterKey []byte) string {
+	h := crypto.NewHMAC(masterKey)
+	for _, event := range events {
+		h.Write([]byte(event))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 func saveAuditLog(path string, auditLog *AuditLog) error {
 	data, err := json.MarshalIndent(auditLog, "", "  ")
 	if err != nil {
@@ -123,6 +156,10 @@ func saveAuditLog(path string, auditLog *AuditLog) error {
 }
 
 func GetAuditHistory(masterKey []byte, limit int, filterUser string, filterAction string) ([]AuditEvent, error) {
+	if err := VerifyAuditLogIntegrity(masterKey); err != nil {
+		return nil, err
+	}
+
 	auditLogPath := GetAuditLogPath()
 	auditLog, err := loadAuditLog(auditLogPath)
 	if err != nil {
