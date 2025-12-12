@@ -47,10 +47,24 @@ func GetVaultDir() string {
 	}
 	return "/var/lib/secrets-manager"
 }
+
 func GetVaultPath() string {
 	vaultDir := GetVaultDir()
 	vaultPath := filepath.Join(vaultDir, "vault.json")
 	return vaultPath
+}
+
+func GetGroupVaultPath() string {
+	vaultDir := GetVaultDir()
+	vaultPath := filepath.Join(vaultDir, "vault-group.json")
+	return vaultPath
+}
+
+func GetVaultPathForMode(useGroup bool) string {
+	if useGroup {
+		return GetGroupVaultPath()
+	}
+	return GetVaultPath()
 }
 
 func isWindows() bool {
@@ -101,7 +115,11 @@ func SaveVault(path string, vault *Vault) error {
 }
 
 func AddSecret(name string, encryptedValue []byte) error {
-	vaultPath := GetVaultPath()
+	return AddSecretWithMode(name, encryptedValue, false)
+}
+
+func AddSecretWithMode(name string, encryptedValue []byte, useGroup bool) error {
+	vaultPath := GetVaultPathForMode(useGroup)
 
 	vault, err := LoadVault(vaultPath)
 	if err != nil {
@@ -119,7 +137,11 @@ func AddSecret(name string, encryptedValue []byte) error {
 }
 
 func GetSecret(name string) ([]byte, error) {
-	vaultPath := GetVaultPath()
+	return GetSecretWithMode(name, false)
+}
+
+func GetSecretWithMode(name string, useGroup bool) ([]byte, error) {
+	vaultPath := GetVaultPathForMode(useGroup)
 	vault, err := LoadVault(vaultPath)
 	if err != nil {
 		return nil, err
@@ -135,7 +157,11 @@ func GetSecret(name string) ([]byte, error) {
 }
 
 func ListSecrets() ([]string, error) {
-	vaultPath := GetVaultPath()
+	return ListSecretsWithMode(false)
+}
+
+func ListSecretsWithMode(useGroup bool) ([]string, error) {
+	vaultPath := GetVaultPathForMode(useGroup)
 	vault, err := LoadVault(vaultPath)
 	if err != nil {
 		return nil, err
@@ -148,8 +174,13 @@ func ListSecrets() ([]string, error) {
 	sort.Strings(names)
 	return names, nil
 }
+
 func DeleteSecret(name string) error {
-	vaultPath := GetVaultPath()
+	return DeleteSecretWithMode(name, false)
+}
+
+func DeleteSecretWithMode(name string, useGroup bool) error {
+	vaultPath := GetVaultPathForMode(useGroup)
 	vault, err := LoadVault(vaultPath)
 	if err != nil {
 		return err
@@ -164,12 +195,16 @@ func DeleteSecret(name string) error {
 	return SaveVault(vaultPath, vault)
 }
 
-func generateVaultID() string {
+func GenerateVaultID() string {
 	b := make([]byte, 32)
 	if _, err := io.ReadFull(rand.Reader, b); err != nil {
 		log.Fatalf("could not generate vault ID: %v", err)
 	}
 	return hex.EncodeToString(b)
+}
+
+func generateVaultID() string {
+	return GenerateVaultID()
 }
 
 func computeVaultHMAC(secrets map[string]string, vaultID string) string {

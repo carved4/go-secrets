@@ -12,12 +12,34 @@ i wanted something simple: a single encrypted vault on my machine, protected by 
 
 secrets manager stores your sensitive data (api keys, tokens, passwords, connection strings) in an encrypted vault. each secret is encrypted with aes-256-gcm, and the master encryption key is stored in your system keyring (windows credential manager, macos keychain, or linux secret service).
 
-you can:
+### core features
+
 - store secrets from your clipboard with one command
 - retrieve secrets to clipboard or display them securely
 - inject all secrets as environment variables into any command
 - list your stored secrets without authentication
 - delete secrets when you're done with them
+
+### backup and recovery
+
+- export encrypted backups of your entire vault
+- import secrets from encrypted backup files
+- automatic backups after add/delete operations
+- keeps last 10 backups with automatic cleanup
+
+### multi-user support
+
+- optional multi-user mode with separate vault
+- per-user encrypted master key shares
+- group-based access control with secret prefix matching
+- independent solo and group vaults can coexist
+
+### audit logging
+
+- encrypted audit trail of all operations
+- tracks user, action, timestamp, ip address, and success/failure
+- view history with the history command
+- retains last 10,000 events
 
 ## installation
 
@@ -33,7 +55,9 @@ on windows, run as administrator. on linux/macos, run with sudo.
 
 ## usage
 
-### initialize your vault
+### solo vault (default)
+
+#### initialize your vault
 
 ```bash
 # windows (run as administrator)
@@ -45,7 +69,7 @@ sudo secrets init
 
 you'll be prompted to create a password (minimum 12 characters). this password encrypts your master key.
 
-### add a secret
+#### add a secret
 
 copy your secret to clipboard, then:
 
@@ -55,7 +79,7 @@ secrets add
 
 you'll be prompted for your password and a name for the secret (use env var format like `DATABASE_URL` or `API_KEY`).
 
-### retrieve a secret
+#### retrieve a secret
 
 ```bash
 # display in terminal
@@ -65,7 +89,7 @@ secrets get DATABASE_URL
 secrets get DATABASE_URL --clip
 ```
 
-### list all secrets
+#### list all secrets
 
 ```bash
 secrets list
@@ -73,13 +97,13 @@ secrets list
 
 no password required - just shows names, not values.
 
-### delete a secret
+#### delete a secret
 
 ```bash
 secrets delete API_KEY
 ```
 
-### run commands with secrets as environment variables
+#### run commands with secrets as environment variables
 
 ```bash
 secrets env run -- node server.js
@@ -88,6 +112,89 @@ secrets env run -- ./your-binary
 ```
 
 all your secrets are automatically injected as environment variables.
+
+### backup and recovery
+
+#### export secrets
+
+```bash
+secrets export backup.enc
+```
+
+creates an encrypted backup file containing all secrets and vault metadata.
+
+#### import secrets
+
+```bash
+secrets import backup.enc
+```
+
+imports and merges secrets from an encrypted backup file.
+
+#### manual backup
+
+```bash
+secrets backup
+```
+
+creates an automatic backup in the vault backup directory. backups are created automatically after add/delete operations.
+
+### multi-user vault
+
+#### initialize group vault
+
+```bash
+secrets --group init
+```
+
+you'll be prompted for:
+- admin username
+- admin password
+- initial group name
+- secret prefixes for the group (comma-separated, e.g., `DB_,API_`)
+
+#### switch between vaults
+
+in interactive mode, use `mode` or `toggle` to switch between solo and group vaults. the prompt shows current mode:
+- `secrets>` - solo vault
+- `secrets[group]>` - group vault
+
+alternatively, use `--group` flag with any command:
+
+```bash
+secrets --group add
+secrets --group list
+```
+
+#### manage users
+
+```bash
+# add a new user
+secrets --group user add
+
+# list all users
+secrets --group user list
+```
+
+#### manage groups
+
+```bash
+# create a new group
+secrets --group group create
+
+# list all groups
+secrets --group group list
+```
+
+groups control access to secrets based on name prefixes. for example, a group with prefix `DB_` can access `DB_PASSWORD` and `DB_URL` but not `API_KEY`.
+
+### audit logging
+
+```bash
+secrets history
+```
+
+displays the last 50 audit events showing user, action, secret name, timestamp, ip address, and success/failure status.
 
 ## why use this over traditional .env files?
 
@@ -121,6 +228,8 @@ all your secrets are automatically injected as environment variables.
 
 ### architecture
 
+#### solo vault
+
 ```
 ┌─────────────────────────────────────────────────┐
 │                  user password                   │
@@ -152,6 +261,28 @@ all your secrets are automatically injected as environment variables.
 └─────────────────────────────────────────────────┘
 ```
 
+#### multi-user vault
+
+```
+vault-group.json structure:
+{
+  "mode": "multi-user",
+  "secrets": { "DB_URL": "encrypted...", ... },
+  "master_key_shares": {
+    "user1": { "encrypted_share": "...", "salt": "..." },
+    "user2": { "encrypted_share": "...", "salt": "..." }
+  },
+  "groups": {
+    "admins": {
+      "users": ["user1", "user2"],
+      "secret_prefix": ["DB_", "API_", "ADMIN_"]
+    }
+  }
+}
+```
+
+each user has their own encrypted copy of the master key. groups define which users can access which secrets based on name prefixes.
+
 ### encryption details
 
 - **key derivation**: pbkdf2-hmac-sha256 with 600,000 iterations (owasp 2023 recommendation)
@@ -161,8 +292,17 @@ all your secrets are automatically injected as environment variables.
 
 ### storage locations
 
-- **windows**: `C:\ProgramData\secrets-manager\vault\vault.json`
-- **linux/macos**: `/var/lib/secrets-manager/vault.json`
+#### windows
+- solo vault: `C:\ProgramData\secrets-manager\vault\vault.json`
+- group vault: `C:\ProgramData\secrets-manager\vault\vault-group.json`
+- audit log: `C:\ProgramData\secrets-manager\vault\audit.json`
+- backups: `C:\ProgramData\secrets-manager\vault\backups\`
+
+#### linux/macos
+- solo vault: `/var/lib/secrets-manager/vault.json`
+- group vault: `/var/lib/secrets-manager/vault-group.json`
+- audit log: `/var/lib/secrets-manager/audit.json`
+- backups: `/var/lib/secrets-manager/backups/`
 
 these directories require administrator/root privileges to write, preventing unauthorized modification.
 
@@ -179,6 +319,10 @@ these directories require administrator/root privileges to write, preventing una
 5. **input validation**: secret names must match `^[A-Z_][A-Z0-9_]*$` to prevent injection attacks when used as environment variables.
 
 6. **clipboard safety**: when copying secrets to clipboard with `--clip`, the clipboard is only cleared if it still contains the secret after 30 seconds (prevents clearing user's new clipboard content).
+
+7. **audit logging**: all operations are logged with encryption. audit events include timestamp, user, action, secret name, ip address, and success/failure status. logs are encrypted with the master key and stored separately from the vault.
+
+8. **automatic backups**: encrypted backups are created automatically after add/delete operations. backups include vault metadata and timestamp, with automatic cleanup keeping only the last 10 backups.
 
 ### dependencies
 
