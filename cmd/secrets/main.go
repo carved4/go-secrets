@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -219,6 +220,8 @@ func executeCommand(args []string) error {
 		return handleGroupCommand(args[1:])
 	case "history":
 		return secretsHistory()
+	case "rotate":
+		return secretsRotate(args[1:])
 	default:
 		ui.PrintError("x", fmt.Sprintf("unknown command: %s", command))
 		fmt.Println()
@@ -252,6 +255,7 @@ func printUsage() {
 	ui.PrintListItem("  >", "import <file>  import secrets from encrypted backup")
 	ui.PrintListItem("  >", "backup         create automatic backup")
 	ui.PrintListItem("  >", "history        view audit log history")
+	ui.PrintListItem("  >", "rotate [name]  rotate all secrets or a specific secret")
 	fmt.Println()
 	ui.PrintInfo("*", "multi-user commands (use with --group):")
 	fmt.Println()
@@ -266,6 +270,8 @@ func printUsage() {
 	ui.PrintMuted("  secrets --group init            # create group vault")
 	ui.PrintMuted("  secrets add                     # add to solo vault")
 	ui.PrintMuted("  secrets add --file secret.txt   # add from file")
+	ui.PrintMuted("  secrets rotate                  # rotate all secrets")
+	ui.PrintMuted("  secrets rotate API_KEY          # rotate specific secret")
 	ui.PrintMuted("  secrets --group add             # add to group vault")
 	ui.PrintMuted("  secrets --group user add        # add user to group vault")
 	fmt.Println()
@@ -688,14 +694,8 @@ func secretsGet(secretName string, useClipboard bool) error {
 		ui.PrintMuted("  use --clip flag to copy to clipboard instead (recommended)")
 		fmt.Println()
 		secretStr := strings.TrimRight(string(secret), "\n\r")
-		secretLen := len(secretStr)
-		if secretLen < 20 {
-			secretLen = 20
-		}
-		ui.PrintDividerWidth(secretLen)
-		fmt.Println(ui.SuccessStyle.Render(secretStr))
-		fmt.Println()
-		ui.PrintDividerWidth(secretLen)
+		ui.PrintMuted("  value:")
+		fmt.Println(ui.SuccessStyle.Render("  " + secretStr))
 		fmt.Println()
 	}
 
@@ -706,24 +706,79 @@ func secretsList() error {
 	ui.PrintTitle("secrets list")
 	fmt.Println()
 
-	names, err := storage.ListSecretsWithMode(useGroupVault)
+	allMetadata, err := storage.GetAllSecretsMetadata(useGroupVault)
 	if err != nil {
 		return fmt.Errorf("failed to list secrets: %w", err)
 	}
 
-	if len(names) == 0 {
+	if len(allMetadata) == 0 {
 		ui.PrintMuted("no secrets stored yet")
 		fmt.Println()
 		return nil
 	}
 
-	ui.PrintInfo("*", fmt.Sprintf("found %d secret(s):", len(names)))
+	ui.PrintInfo("*", fmt.Sprintf("found %d secret(s):", len(allMetadata)))
 	fmt.Println()
+
+	names := make([]string, 0, len(allMetadata))
+	for name := range allMetadata {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
 	for _, name := range names {
-		ui.PrintSuccess("  +", name)
+		metadata := allMetadata[name]
+		age := time.Since(metadata.CreatedAt)
+		ageStr := formatDuration(age)
+
+		if metadata.CreatedAt.Equal(metadata.UpdatedAt) {
+			ui.PrintSuccess("  +", fmt.Sprintf("%s (created %s ago)", name, ageStr))
+		} else {
+			updateAge := time.Since(metadata.UpdatedAt)
+			ui.PrintSuccess("  +", fmt.Sprintf("%s (created %s ago, updated %s ago)", name, ageStr, formatDuration(updateAge)))
+		}
 	}
 	fmt.Println()
 	return nil
+}
+
+func formatDuration(d time.Duration) string {
+	if d < time.Minute {
+		return "just now"
+	}
+	if d < time.Hour {
+		mins := int(d.Minutes())
+		if mins == 1 {
+			return "1 minute"
+		}
+		return fmt.Sprintf("%d minutes", mins)
+	}
+	if d < 24*time.Hour {
+		hours := int(d.Hours())
+		if hours == 1 {
+			return "1 hour"
+		}
+		return fmt.Sprintf("%d hours", hours)
+	}
+	days := int(d.Hours() / 24)
+	if days == 1 {
+		return "1 day"
+	}
+	if days < 30 {
+		return fmt.Sprintf("%d days", days)
+	}
+	months := days / 30
+	if months == 1 {
+		return "1 month"
+	}
+	if months < 12 {
+		return fmt.Sprintf("%d months", months)
+	}
+	years := months / 12
+	if years == 1 {
+		return "1 year"
+	}
+	return fmt.Sprintf("%d years", years)
 }
 
 func secretsDelete(secretName string) error {

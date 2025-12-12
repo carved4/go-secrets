@@ -17,14 +17,15 @@ secrets manager stores your sensitive data (api keys, tokens, passwords, connect
 - store secrets from your clipboard with one command
 - retrieve secrets to clipboard or display them securely
 - inject all secrets as environment variables into any command
-- list your stored secrets without authentication
+- list your stored secrets with age tracking (no authentication required)
+- rotate secrets individually or in bulk from .env files
 - delete secrets when you're done with them
 
 ### backup and recovery
 
 - export encrypted backups of your entire vault
 - import secrets from encrypted backup files
-- automatic backups after add/delete operations
+- automatic backups after add/delete/rotate operations
 - keeps last 10 backups with automatic cleanup
 
 ### multi-user support
@@ -94,13 +95,40 @@ secrets get DATABASE_URL --clip
 secrets list
 ```
 
-no password required - just shows names, not values.
+no password required - shows secret names with creation and update timestamps.
+
+example output:
+```
++ DATABASE_URL (created 5 days ago)
++ API_KEY (created 2 months ago, updated 3 days ago)
+```
 
 #### delete a secret
 
 ```bash
 secrets delete API_KEY
 ```
+
+#### rotate secrets
+
+rotate all secrets (post-compromise or regular rotation):
+
+```bash
+secrets rotate
+```
+
+you'll be asked if you want to import from a `.env` file or paste each secret individually. importing from a file will:
+1. parse the `.env` file
+2. replace all secrets with new values
+3. offer to delete the source file for security
+
+rotate a specific secret:
+
+```bash
+secrets rotate API_KEY
+```
+
+prompts you to paste the new value for that specific secret.
 
 #### run commands with secrets as environment variables
 

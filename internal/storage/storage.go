@@ -12,12 +12,20 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 )
 
+type SecretMetadata struct {
+	EncryptedValue string    `json:"encrypted_value"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
 type Vault struct {
-	Secrets map[string]string `json:"secrets"`
-	HMAC    string            `json:"hmac"`
-	VaultID string            `json:"vault_id,omitempty"`
+	Secrets         map[string]string         `json:"secrets,omitempty"`
+	SecretsMetadata map[string]SecretMetadata `json:"secrets_metadata,omitempty"`
+	HMAC            string                    `json:"hmac"`
+	VaultID         string                    `json:"vault_id,omitempty"`
 }
 
 func InitVault() error {
@@ -31,8 +39,8 @@ func InitVault() error {
 
 	vaultID := generateVaultID()
 	vault := &Vault{
-		Secrets: make(map[string]string),
-		VaultID: vaultID,
+		SecretsMetadata: make(map[string]SecretMetadata),
+		VaultID:         vaultID,
 	}
 
 	if err := SaveVault(vaultPath, vault); err != nil {
@@ -80,8 +88,22 @@ func LoadVault(path string) (*Vault, error) {
 	if err := json.Unmarshal(data, &vault); err != nil {
 		return nil, err
 	}
-	if vault.Secrets == nil {
-		vault.Secrets = make(map[string]string)
+
+	// Migrate old format to new format with metadata
+	if vault.Secrets != nil && vault.SecretsMetadata == nil {
+		vault.SecretsMetadata = make(map[string]SecretMetadata)
+		for name, encValue := range vault.Secrets {
+			vault.SecretsMetadata[name] = SecretMetadata{
+				EncryptedValue: encValue,
+				CreatedAt:      time.Now(),
+				UpdatedAt:      time.Now(),
+			}
+		}
+		vault.Secrets = nil
+	}
+
+	if vault.SecretsMetadata == nil {
+		vault.SecretsMetadata = make(map[string]SecretMetadata)
 	}
 
 	if vault.VaultID == "" {
@@ -89,7 +111,7 @@ func LoadVault(path string) (*Vault, error) {
 	}
 
 	if vault.HMAC != "" {
-		expectedHMAC := computeVaultHMAC(vault.Secrets, vault.VaultID)
+		expectedHMAC := computeVaultHMAC(vault.SecretsMetadata, vault.VaultID)
 		if vault.HMAC != expectedHMAC {
 			return nil, fmt.Errorf("vault integrity check failed - possible tampering detected")
 		}
@@ -99,7 +121,7 @@ func LoadVault(path string) (*Vault, error) {
 }
 
 func SaveVault(path string, vault *Vault) error {
-	vault.HMAC = computeVaultHMAC(vault.Secrets, vault.VaultID)
+	vault.HMAC = computeVaultHMAC(vault.SecretsMetadata, vault.VaultID)
 
 	data, err := json.MarshalIndent(vault, "", "  ")
 	if err != nil {
@@ -127,7 +149,21 @@ func AddSecretWithMode(name string, encryptedValue []byte, useGroup bool) error 
 		return fmt.Errorf("failed to load vault: %w", err)
 	}
 
-	vault.Secrets[name] = hex.EncodeToString(encryptedValue)
+	now := time.Now()
+	existing, exists := vault.SecretsMetadata[name]
+	if exists {
+		vault.SecretsMetadata[name] = SecretMetadata{
+			EncryptedValue: hex.EncodeToString(encryptedValue),
+			CreatedAt:      existing.CreatedAt,
+			UpdatedAt:      now,
+		}
+	} else {
+		vault.SecretsMetadata[name] = SecretMetadata{
+			EncryptedValue: hex.EncodeToString(encryptedValue),
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+	}
 
 	if err := SaveVault(vaultPath, vault); err != nil {
 		log.Printf("AddSecret: failed to save vault to %s: %v", vaultPath, err)
@@ -147,11 +183,11 @@ func GetSecretWithMode(name string, useGroup bool) ([]byte, error) {
 		return nil, err
 	}
 
-	encryptedHex, exists := vault.Secrets[name]
+	metadata, exists := vault.SecretsMetadata[name]
 	if !exists {
 		return nil, fmt.Errorf("secret not found")
 	}
-	encryptedBytes, err := hex.DecodeString(encryptedHex)
+	encryptedBytes, err := hex.DecodeString(metadata.EncryptedValue)
 
 	return encryptedBytes, err
 }
@@ -167,8 +203,8 @@ func ListSecretsWithMode(useGroup bool) ([]string, error) {
 		return nil, err
 	}
 
-	names := make([]string, 0, len(vault.Secrets))
-	for name := range vault.Secrets {
+	names := make([]string, 0, len(vault.SecretsMetadata))
+	for name := range vault.SecretsMetadata {
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -186,11 +222,11 @@ func DeleteSecretWithMode(name string, useGroup bool) error {
 		return err
 	}
 
-	if _, exists := vault.Secrets[name]; !exists {
+	if _, exists := vault.SecretsMetadata[name]; !exists {
 		return fmt.Errorf("secret '%s' not found", name)
 	}
 
-	delete(vault.Secrets, name)
+	delete(vault.SecretsMetadata, name)
 
 	return SaveVault(vaultPath, vault)
 }
@@ -207,19 +243,55 @@ func generateVaultID() string {
 	return GenerateVaultID()
 }
 
-func computeVaultHMAC(secrets map[string]string, vaultID string) string {
+func GetSecretMetadata(name string, useGroup bool) (*SecretMetadata, error) {
+	vaultPath := GetVaultPathForMode(useGroup)
+	vault, err := LoadVault(vaultPath)
+	if err != nil {
+		return nil, err
+	}
+
+	metadata, exists := vault.SecretsMetadata[name]
+	if !exists {
+		return nil, fmt.Errorf("secret not found")
+	}
+
+	return &metadata, nil
+}
+
+func GetAllSecretsMetadata(useGroup bool) (map[string]SecretMetadata, error) {
+	vaultPath := GetVaultPathForMode(useGroup)
+	vault, err := LoadVault(vaultPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return vault.SecretsMetadata, nil
+}
+
+func ClearAllSecrets(useGroup bool) error {
+	vaultPath := GetVaultPathForMode(useGroup)
+	vault, err := LoadVault(vaultPath)
+	if err != nil {
+		return err
+	}
+
+	vault.SecretsMetadata = make(map[string]SecretMetadata)
+	return SaveVault(vaultPath, vault)
+}
+
+func computeVaultHMAC(secretsMetadata map[string]SecretMetadata, vaultID string) string {
 	key := sha256.Sum256([]byte("vault-integrity-key-" + vaultID))
 	h := hmac.New(sha256.New, key[:])
 
-	names := make([]string, 0, len(secrets))
-	for name := range secrets {
+	names := make([]string, 0, len(secretsMetadata))
+	for name := range secretsMetadata {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 
 	for _, name := range names {
 		h.Write([]byte(name))
-		h.Write([]byte(secrets[name]))
+		h.Write([]byte(secretsMetadata[name].EncryptedValue))
 	}
 
 	return hex.EncodeToString(h.Sum(nil))
