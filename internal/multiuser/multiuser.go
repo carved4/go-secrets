@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 
 	"github.com/carved4/go-secrets/internal/crypto"
@@ -71,6 +72,12 @@ func SaveMultiUserVault(path string, vault *MultiUserVault) error {
 	data, err := json.MarshalIndent(vault, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal vault: %w", err)
+	}
+
+	// Ensure vault directory exists
+	vaultDir := filepath.Dir(path)
+	if err := os.MkdirAll(vaultDir, 0700); err != nil {
+		return fmt.Errorf("failed to create vault directory: %w", err)
 	}
 
 	if err := os.WriteFile(path, data, 0600); err != nil {

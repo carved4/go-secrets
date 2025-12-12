@@ -99,9 +99,16 @@ func runInteractiveMode() {
 
 		args := parseCommand(input)
 		if len(args) > 0 {
+			// Store current mode state
+			previousMode := useGroupVault
 			cleanArgs, groupFlag := parseGlobalFlags(args)
+			// Only override if --group flag is explicitly present
+			// Otherwise preserve the toggled state from 'mode' command
 			if groupFlag {
 				useGroupVault = true
+			} else {
+				// Restore previous mode if no flag was specified
+				useGroupVault = previousMode
 			}
 			args = cleanArgs
 		}
