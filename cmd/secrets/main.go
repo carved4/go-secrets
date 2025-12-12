@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +12,7 @@ import (
 	"github.com/carved4/go-secrets/internal/audit"
 	"github.com/carved4/go-secrets/internal/backup"
 	"github.com/carved4/go-secrets/internal/crypto"
+	"github.com/carved4/go-secrets/internal/envinjector"
 	"github.com/carved4/go-secrets/internal/keyring"
 	"github.com/carved4/go-secrets/internal/multiuser"
 	"github.com/carved4/go-secrets/internal/privileges"
@@ -180,7 +180,7 @@ func executeCommand(args []string) error {
 		return secretsDelete(args[1])
 	case "env":
 		if len(args) < 3 || args[1] != "run" || args[2] != "--" {
-			ui.PrintError("x", "usage: secrets env run -- <command> [args...]")
+			ui.PrintError("x", "usage: secrets env run [--prefix PREFIX1,PREFIX2] -- <command> [args...]")
 			return nil
 		}
 		return secretsEnvRun(args[3:])
@@ -671,6 +671,29 @@ func secretsEnvRun(cmdArgs []string) error {
 	ui.PrintTitle("running with secrets")
 	fmt.Println()
 
+	var filterPrefixes []string
+	var actualCmd []string
+
+	for i := 0; i < len(cmdArgs); i++ {
+		if cmdArgs[i] == "--prefix" && i+1 < len(cmdArgs) {
+			filterPrefixes = strings.Split(cmdArgs[i+1], ",")
+			for j := range filterPrefixes {
+				filterPrefixes[j] = strings.TrimSpace(filterPrefixes[j])
+			}
+			i++
+		} else if cmdArgs[i] == "--" {
+			actualCmd = cmdArgs[i+1:]
+			break
+		} else {
+			actualCmd = cmdArgs[i:]
+			break
+		}
+	}
+
+	if len(actualCmd) == 0 {
+		return fmt.Errorf("no command specified after --")
+	}
+
 	if err := storage.CheckRateLimit(); err != nil {
 		return err
 	}
@@ -680,6 +703,7 @@ func secretsEnvRun(cmdArgs []string) error {
 		return fmt.Errorf("failed to read password: %w", err)
 	}
 	defer crypto.CleanupBytes(password)
+
 	encryptedMasterKey, salt, err := keyring.LoadEncryptedMasterKey()
 	if err != nil {
 		return fmt.Errorf("failed to load encrypted master key: %w", err)
@@ -700,61 +724,59 @@ func secretsEnvRun(cmdArgs []string) error {
 
 	storage.ResetRateLimit()
 
-	secrets, err := loadAllSecrets(masterKey)
-	if err != nil {
+	injector := envinjector.NewSecureEnvInjector()
+	defer injector.Cleanup()
+
+	if err := loadSecretsIntoInjector(masterKey, injector, filterPrefixes); err != nil {
 		return fmt.Errorf("failed to load secrets: %w", err)
 	}
 
-	ui.PrintSuccess("+", fmt.Sprintf("loaded %d secret(s) into environment", len(secrets)))
-	for _, env := range secrets {
-		parts := strings.SplitN(env, "=", 2)
-		if len(parts) == 2 {
-			preview := parts[1]
-			if len(preview) > 30 {
-				preview = preview[:30] + "..."
-			}
-			ui.PrintMuted(fmt.Sprintf("  %s=%s", parts[0], preview))
-		}
+	ui.PrintSuccess("+", fmt.Sprintf("loaded %d secret(s) into environment", injector.GetSecretCount()))
+	if len(filterPrefixes) > 0 {
+		ui.PrintMuted(fmt.Sprintf("  filtered by prefixes: %s", strings.Join(filterPrefixes, ", ")))
 	}
-	ui.PrintMuted(fmt.Sprintf("  running: %s", strings.Join(cmdArgs, " ")))
+	for _, name := range injector.GetSecretNames() {
+		ui.PrintMuted(fmt.Sprintf("  %s=[REDACTED]", name))
+	}
+	ui.PrintMuted(fmt.Sprintf("  running: %s", strings.Join(actualCmd, " ")))
 	fmt.Println()
 
-	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
-	cmd.Env = append(os.Environ(), secrets...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
+	if err := injector.RunCommand(actualCmd, filterPrefixes); err != nil {
 		return fmt.Errorf("command failed: %w", err)
 	}
 
 	return nil
 }
 
-func loadAllSecrets(masterKey []byte) ([]string, error) {
+func loadSecretsIntoInjector(masterKey []byte, injector *envinjector.SecureEnvInjector, filterPrefixes []string) error {
 	names, err := storage.ListSecretsWithMode(useGroupVault)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	var envVars []string
-	for _, name := range names {
+	filter := envinjector.NewSecretFilter()
+	if len(filterPrefixes) > 0 {
+		filter.AllowPrefixes(filterPrefixes)
+	}
+
+	filteredNames := filter.FilterSecrets(names)
+
+	for _, name := range filteredNames {
 		encryptedSecret, err := storage.GetSecretWithMode(name, useGroupVault)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get secret %s: %w", name, err)
+			return fmt.Errorf("failed to get secret %s: %w", name, err)
 		}
 
 		secret, err := crypto.DecryptSecret(encryptedSecret, masterKey)
 		if err != nil {
-			return nil, fmt.Errorf("failed to decrypt secret %s: %w", name, err)
+			return fmt.Errorf("failed to decrypt secret %s: %w", name, err)
 		}
-		crypto.SecureBytes(secret)
-		envVars = append(envVars, fmt.Sprintf("%s=%s", name, strings.TrimSpace(string(secret))))
+
+		injector.AddSecret(name, secret)
 		crypto.CleanupBytes(secret)
 	}
 
-	return envVars, nil
+	return nil
 }
 
 func secretsExport(outputFile string) error {
