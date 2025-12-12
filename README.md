@@ -46,9 +46,7 @@ secrets manager stores your sensitive data (api keys, tokens, passwords, connect
 requires go 1.24 or later.
 
 ```bash
-git clone github.com/carved4/go-secrets
-cd go-secrets/cmd/secrets
-go build .
+go install github.com/carved4/go-secrets/cmd/secrets@latest
 ```
 
 on windows, run as administrator. on linux/macos, run with sudo.
@@ -61,7 +59,8 @@ on windows, run as administrator. on linux/macos, run with sudo.
 
 ```bash
 # windows (run as administrator)
-secrets.exe init
+# open cmd prompt as admin, then
+secrets
 
 # linux/macos (run with sudo)
 sudo secrets init
