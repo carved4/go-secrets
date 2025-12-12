@@ -13,14 +13,14 @@ import (
 )
 
 type ExportBlob struct {
-	Version    string            `json:"version"`
-	ExportedAt time.Time         `json:"exported_at"`
-	VaultID    string            `json:"vault_id"`
-	Secrets    map[string]string `json:"secrets"`
-	MasterKey  string            `json:"master_key"`
-	Salt       string            `json:"salt"`
-	Nonce      string            `json:"nonce"`
-	Encrypted  bool              `json:"encrypted"`
+	Version         string                            `json:"version"`
+	ExportedAt      time.Time                         `json:"exported_at"`
+	VaultID         string                            `json:"vault_id"`
+	SecretsMetadata map[string]storage.SecretMetadata `json:"secrets_metadata"`
+	MasterKey       string                            `json:"master_key"`
+	Salt            string                            `json:"salt"`
+	Nonce           string                            `json:"nonce"`
+	Encrypted       bool                              `json:"encrypted"`
 }
 
 func ExportSecrets(password []byte) ([]byte, error) {
@@ -36,12 +36,12 @@ func ExportSecrets(password []byte) ([]byte, error) {
 	defer crypto.CleanupBytes(derivedKey)
 
 	blob := &ExportBlob{
-		Version:    "1.0",
-		ExportedAt: time.Now(),
-		VaultID:    vault.VaultID,
-		Secrets:    vault.Secrets,
-		Encrypted:  true,
-		Salt:       hex.EncodeToString(salt),
+		Version:         "1.0",
+		ExportedAt:      time.Now(),
+		VaultID:         vault.VaultID,
+		SecretsMetadata: vault.SecretsMetadata,
+		Encrypted:       true,
+		Salt:            hex.EncodeToString(salt),
 	}
 
 	blobJSON, err := json.Marshal(blob)
@@ -109,8 +109,8 @@ func RestoreFromBlob(blob *ExportBlob) error {
 		return fmt.Errorf("failed to load current vault: %w", err)
 	}
 
-	for name, encryptedValue := range blob.Secrets {
-		vault.Secrets[name] = encryptedValue
+	for name, metadata := range blob.SecretsMetadata {
+		vault.SecretsMetadata[name] = metadata
 	}
 
 	if err := storage.SaveVault(storage.GetVaultPath(), vault); err != nil {

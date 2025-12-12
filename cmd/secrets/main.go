@@ -1040,7 +1040,7 @@ func secretsImport(inputFile string) error {
 
 	storage.ResetRateLimit()
 
-	ui.PrintInfo(">", fmt.Sprintf("found %d secret(s) in backup", len(blob.Secrets)))
+	ui.PrintInfo(">", fmt.Sprintf("found %d secret(s) in backup", len(blob.SecretsMetadata)))
 	ui.PrintMuted(fmt.Sprintf("  exported at: %s", blob.ExportedAt.Format("2006-01-02 15:04:05")))
 	fmt.Println()
 
