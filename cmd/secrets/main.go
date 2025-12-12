@@ -162,6 +162,13 @@ func executeCommand(args []string) error {
 	case "init":
 		return secretsInit(useGroupVault)
 	case "add":
+		if len(args) > 1 && args[1] == "--file" {
+			if len(args) < 3 {
+				ui.PrintError("x", "usage: secrets add --file <filepath>")
+				return nil
+			}
+			return secretsAddFromFile(args[2])
+		}
 		return secretsAdd()
 	case "get":
 		if len(args) < 2 {
@@ -236,6 +243,7 @@ func printUsage() {
 	fmt.Println()
 	ui.PrintListItem("  >", "init           initialize a new secrets vault")
 	ui.PrintListItem("  >", "add            add a new secret from clipboard")
+	ui.PrintListItem("  >", "add --file <path>  add a secret from file")
 	ui.PrintListItem("  >", "get <name> [--clip]  retrieve a secret")
 	ui.PrintListItem("  >", "list           list all secret names")
 	ui.PrintListItem("  >", "delete <name>  delete a secret")
@@ -257,6 +265,7 @@ func printUsage() {
 	ui.PrintMuted("  secrets init                    # create solo vault")
 	ui.PrintMuted("  secrets --group init            # create group vault")
 	ui.PrintMuted("  secrets add                     # add to solo vault")
+	ui.PrintMuted("  secrets add --file secret.txt   # add from file")
 	ui.PrintMuted("  secrets --group add             # add to group vault")
 	ui.PrintMuted("  secrets --group user add        # add user to group vault")
 	fmt.Println()
@@ -448,6 +457,121 @@ func secretsAdd() error {
 	fmt.Println()
 	ui.PrintSuccess("+", fmt.Sprintf("secret '%s' added successfully!", secretName))
 	ui.PrintSuccess("+", "clipboard cleared for security")
+	fmt.Println()
+	ui.PrintTip("tip: name secrets like env vars (e.g., DATABASE_URL, API_KEY)")
+	ui.PrintTip("     then use: secrets env run -- <your-command>")
+	fmt.Println()
+	return nil
+}
+
+func secretsAddFromFile(filePath string) error {
+	ui.PrintTitle("adding secret from file")
+	fmt.Println()
+
+	if err := storage.CheckRateLimit(); err != nil {
+		return err
+	}
+
+	fileData, err := os.ReadFile(filePath)
+	if err != nil {
+		ui.PrintError("x", fmt.Sprintf("failed to read file: %v", err))
+		fmt.Println()
+		return fmt.Errorf("failed to read file: %w", err)
+	}
+
+	secretValue := string(fileData)
+	const maxSecretSize = 10 * 1024 * 1024
+	if len(secretValue) > maxSecretSize {
+		ui.PrintError("x", fmt.Sprintf("secret too large (max %d bytes, got %d bytes)", maxSecretSize, len(secretValue)))
+		fmt.Println()
+		return fmt.Errorf("secret exceeds maximum size")
+	}
+
+	ui.PrintSuccess("+", fmt.Sprintf("secret loaded from file: %s", filePath))
+	ui.PrintMuted(fmt.Sprintf("  size: %d bytes", len(secretValue)))
+	fmt.Println()
+
+	password, err := crypto.ReadUserPass()
+	if err != nil {
+		return fmt.Errorf("failed to read password")
+	}
+	defer crypto.CleanupBytes(password)
+	encryptedMasterKey, salt, err := keyring.LoadEncryptedMasterKey()
+	if err != nil {
+		return fmt.Errorf("failed to load encrypted master key from vault")
+	}
+	derivedKey, _, err := crypto.DeriveKeyFromUserPass([]byte(password), salt)
+	if err != nil {
+		return fmt.Errorf("failed to derive key from user secret")
+	}
+	defer crypto.CleanupBytes(derivedKey)
+
+	masterKey, err := crypto.DecryptMasterKey(encryptedMasterKey, derivedKey)
+	if err != nil {
+		storage.RecordFailedAttempt()
+		return fmt.Errorf("failed to decrypt master key - incorrect password")
+	}
+	defer crypto.CleanupBytes(masterKey)
+
+	storage.ResetRateLimit()
+
+	secretBytes := []byte(secretValue)
+	crypto.SecureBytes(secretBytes)
+	defer crypto.CleanupBytes(secretBytes)
+
+	encryptedSecret, err := crypto.EncryptSecret(secretBytes, masterKey)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt secret")
+	}
+	secretName, err := crypto.ReadSecretName()
+	if err != nil {
+		return fmt.Errorf("failed to read secret name")
+	}
+
+	if useGroupVault {
+		if err := promptForUsername(); err != nil {
+			return err
+		}
+		canAccess, err := multiuser.UserCanAccessSecret(currentUsername, secretName)
+		if err != nil {
+			return fmt.Errorf("failed to check access: %w", err)
+		}
+		if !canAccess {
+			return fmt.Errorf("access denied: user '%s' does not have permission to add secrets with prefix '%s'", currentUsername, secretName)
+		}
+	}
+
+	if err := storage.AddSecretWithMode(secretName, encryptedSecret, useGroupVault); err != nil {
+		audit.LogEvent(currentUsername, "add", secretName, false, err.Error(), masterKey)
+		return fmt.Errorf("failed to store secret in vault")
+	}
+
+	if err := backup.CreateAutoBackup(password); err != nil {
+		ui.PrintWarning("!", fmt.Sprintf("warning: auto-backup failed: %v", err))
+	}
+
+	audit.LogEvent(currentUsername, "add", secretName, true, "", masterKey)
+
+	fmt.Println()
+	ui.PrintSuccess("+", fmt.Sprintf("secret '%s' added successfully!", secretName))
+	fmt.Println()
+
+	ui.PrintWarning("!", "delete the source file for security?")
+	ui.PrintPrompt("remove file? (yes/no): ")
+	var confirm string
+	fmt.Scanln(&confirm)
+
+	if confirm == "yes" || confirm == "y" {
+		if err := os.Remove(filePath); err != nil {
+			ui.PrintError("x", fmt.Sprintf("failed to remove file: %v", err))
+			ui.PrintMuted("  you may need to delete it manually")
+		} else {
+			ui.PrintSuccess("+", "source file removed")
+		}
+	} else {
+		ui.PrintWarning("!", "source file kept - remember to delete it manually!")
+	}
+
 	fmt.Println()
 	ui.PrintTip("tip: name secrets like env vars (e.g., DATABASE_URL, API_KEY)")
 	ui.PrintTip("     then use: secrets env run -- <your-command>")
