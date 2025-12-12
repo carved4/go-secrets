@@ -4,20 +4,36 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"os"
 	"runtime"
 	"strings"
 
 	"github.com/zalando/go-keyring"
 )
 
+func getKeyringService() string {
+	service := "secrets-manager"
+
+	if runtime.GOOS == "linux" {
+		if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+			service = "secrets-manager-" + sudoUser
+		}
+	}
+
+	return service
+}
+
 func StoreEncryptedMasterKey(encryptedKey []byte, salt []byte) error {
 	encryptedKeyHex := hex.EncodeToString(encryptedKey)
 	saltHex := hex.EncodeToString(salt)
-	if err := keyring.Set("secrets-manager", "encrypted_master_key", encryptedKeyHex); err != nil {
+
+	service := getKeyringService()
+
+	if err := keyring.Set(service, "encrypted_master_key", encryptedKeyHex); err != nil {
 		log.Println("failed to store encrypted master key in keyring")
 		return formatKeyringError(err)
 	}
-	if err := keyring.Set("secrets-manager", "salt", saltHex); err != nil {
+	if err := keyring.Set(service, "salt", saltHex); err != nil {
 		log.Println("failed to store salt in keyring")
 		return formatKeyringError(err)
 	}
@@ -25,12 +41,14 @@ func StoreEncryptedMasterKey(encryptedKey []byte, salt []byte) error {
 }
 
 func LoadEncryptedMasterKey() (encryptedKey []byte, salt []byte, err error) {
-	encryptedKeyHex, err := keyring.Get("secrets-manager", "encrypted_master_key")
+	service := getKeyringService()
+
+	encryptedKeyHex, err := keyring.Get(service, "encrypted_master_key")
 	if err != nil {
 		log.Println("failed to get master key from keyring")
 		return nil, nil, err
 	}
-	saltHex, err := keyring.Get("secrets-manager", "salt")
+	saltHex, err := keyring.Get(service, "salt")
 	if err != nil {
 		log.Println("failed to get salt from keyring")
 		return nil, nil, err
@@ -49,8 +67,9 @@ func LoadEncryptedMasterKey() (encryptedKey []byte, salt []byte, err error) {
 }
 
 func DeleteMasterKey() error {
-	keyring.Delete("secrets-manager", "encrypted_master_key")
-	keyring.Delete("secrets-manager", "salt")
+	service := getKeyringService()
+	keyring.Delete(service, "encrypted_master_key")
+	keyring.Delete(service, "salt")
 	return nil
 }
 
