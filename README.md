@@ -14,6 +14,7 @@ secrets manager stores your sensitive data (api keys, tokens, passwords, connect
 
 ### core features
 
+- **transparent secret injection**: daemon-based system that injects secrets into node.js and python apps without touching the environment
 - **multiple vaults**: create separate vaults for different contexts (personal, work, projects)
 - **easy vault switching**: switch between vaults with a single command
 - store secrets from your clipboard with one command
@@ -150,15 +151,48 @@ secrets rotate API_KEY
 
 prompts you to paste the new value for that specific secret.
 
-#### run commands with secrets as environment variables
+#### transparent secret injection with daemon (recommended)
+
+start the daemon to hold vault credentials in memory (authenticate once, run many commands):
 
 ```bash
+# start daemon (authenticate once)
+secrets daemon start
+
+# now run apps with transparent secret injection - no password needed!
+secrets env run -- node server.js
+secrets env run -- python app.py
+
+# secrets are fetched on-demand from daemon via IPC
+# they never touch the actual process environment (more secure!)
+
+# check daemon status
+secrets daemon status
+
+# stop daemon when done
+secrets daemon stop
+```
+
+**how it works**: the daemon holds your vault credentials in memory. when you run a command, secrets are injected via language-specific shims that intercept environment variable access. this means:
+- secrets aren't in the os environment (immune to `printenv` dumps)
+- no password needed for subsequent commands (perfect for ci/cd)
+- secrets are fetched on-demand via windows named pipes (local ipc only)
+- works transparently with existing code - no changes needed
+
+**supported runtimes**:
+- node.js (uses `-r` preload hook)
+- python (requires `pywin32`: `pip install pywin32`)
+
+#### run commands with secrets as environment variables (legacy)
+
+```bash
+# without daemon (asks for password each time)
 secrets env run -- node server.js
 secrets env run -- python app.py
 secrets env run -- ./your-binary
 ```
 
-all your secrets are automatically injected as environment variables.
+all your secrets are injected as environment variables. use the daemon approach (above) for better security and convenience.
 
 #### store and restore large files (databases, keys, assets)
 
@@ -289,7 +323,7 @@ audit logs track both local network IP and public IP to help identify access pat
 
 **encrypted at rest**: your secrets are encrypted with aes-256-gcm. even if someone gets your vault file, they can't read it without your password and the master key from your system keyring.
 
-**no plaintext files**: traditional `.env` files are plaintext. they get committed to git, copied around, left in temp directories, and post compromise everything is just one 'env' command away. secrets manager never writes plaintext secrets to disk, and with this you can replace storing anything in your environment variables, just inject them with the binary :3
+**no plaintext files**: traditional `.env` files are plaintext. they get committed to git, copied around, left in temp directories. with the daemon-based injection, secrets never touch the os environment - they're fetched on-demand via ipc and live only in your app's memory space.
 
 **os-level key protection**: the master encryption key is stored in your system keyring (windows credential manager, macos keychain, linux secret service). these are designed to protect sensitive data and integrate with your os security.
 
@@ -304,6 +338,8 @@ audit logs track both local network IP and public IP to help identify access pat
 **centralized management**: one vault for all your secrets across all projects. no more hunting through dozens of `.env` files.
 
 **clipboard integration**: copy secrets directly to clipboard with auto-clear after 30 seconds. no terminal history pollution.
+
+**daemon-based injection (windows)**: authenticate once, run many commands. secrets are fetched via windows named pipes (local ipc) and injected transparently into node.js/python apps without touching the os environment.
 
 **easy injection**: `secrets env run --` injects all secrets as environment variables without modifying your shell or project files.
 
@@ -425,6 +461,8 @@ these directories require administrator/root privileges to write, preventing una
 
 10. **async public ip fetching**: public ip addresses are fetched asynchronously during audit logging to avoid blocking operations, with a 3-second timeout per service.
 
+11. **daemon-based transparent injection (windows)**: secrets are served via windows named pipes with token-based authentication. secrets never touch the os environment and are fetched on-demand via local ipc. tokens expire after 1 hour and use 256-bit cryptographic randomness.
+
 ### dependencies
 
 - `golang.org/x/crypto` - pbkdf2 key derivation
@@ -432,14 +470,16 @@ these directories require administrator/root privileges to write, preventing una
 - `github.com/zalando/go-keyring` - system keyring integration
 - `github.com/atotto/clipboard` - clipboard operations
 - `github.com/charmbracelet/lipgloss` - terminal ui styling
+- `github.com/Microsoft/go-winio` - windows named pipes for daemon ipc
 
 ## security considerations
 
 this tool is designed for local dev use. it's significantly more secure than plaintext `.env` files, but it's not a replacement for production secret management systems like hashicorp vault or aws secrets manager.
 
-**threat model**: protects against accidental exposure (git commits, file sharing), casual snooping, basic attacks, and even admin/root access without your password. does not protect against:
+**threat model**: protects against accidental exposure (git commits, file sharing), casual snooping, basic attacks, environment variable dumps, and even admin/root access without your password. the daemon-based injection prevents secrets from appearing in the os environment (`printenv` returns nothing). does not protect against:
 - malware with keylogger capabilities (can capture your password as you type it)
-- sophisticated memory dump attacks (untested, but memory locking should help)
+- sophisticated memory dump attacks of the running application (secrets are in app memory after injection)
+- process memory scanning (secrets exist in app memory space, though not in peb/environment block)
 
 note: even with physical access to an unlocked system, secrets are safe unless you have a terminal open displaying them without using `--clip`. admin/root access alone doesn't help an attacker, they still need your password.
 
