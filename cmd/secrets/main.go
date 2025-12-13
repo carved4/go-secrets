@@ -2,8 +2,11 @@ package main
 
 import (
 	"bufio"
+	"crypto/rand"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -294,6 +297,18 @@ func executeCommand(args []string) error {
 			return nil
 		}
 		return handleVaultCommand(args[1:])
+	case "restore":
+		if len(args) < 2 {
+			ui.PrintError("x", "usage: secrets restore <name> [--output <path>]")
+			return nil
+		}
+		return secretsRestore(args[1:])
+	case "wipe":
+		if len(args) < 2 {
+			ui.PrintError("x", "usage: secrets wipe <filepath>")
+			return nil
+		}
+		return secretsWipeFile(args[1])
 	default:
 		ui.PrintError("x", fmt.Sprintf("unknown command: %s", command))
 		fmt.Println()
@@ -328,6 +343,8 @@ func printUsage() {
 	ui.PrintListItem("  >", "backup         create automatic backup")
 	ui.PrintListItem("  >", "history        view audit log history")
 	ui.PrintListItem("  >", "rotate [name]  rotate all secrets or a specific secret")
+	ui.PrintListItem("  >", "restore <name> [--output <path>]  restore secret to file")
+	ui.PrintListItem("  >", "wipe <path>    securely delete a file")
 	fmt.Println()
 	ui.PrintInfo("*", "vault management:")
 	fmt.Println()
@@ -352,6 +369,8 @@ func printUsage() {
 	ui.PrintMuted("  secrets add --file secret.txt   # add from file")
 	ui.PrintMuted("  secrets rotate                  # rotate all secrets")
 	ui.PrintMuted("  secrets rotate API_KEY          # rotate specific secret")
+	ui.PrintMuted("  secrets restore DB_FILE --output ./database.db  # restore file secret")
+	ui.PrintMuted("  secrets wipe ./database.db      # securely delete file")
 	ui.PrintMuted("  secrets --group add             # add to group vault")
 	ui.PrintMuted("  secrets --group user add        # add user to group vault")
 	fmt.Println()
@@ -577,23 +596,38 @@ func secretsAddFromFile(filePath string) error {
 		return err
 	}
 
-	fileData, err := os.ReadFile(filePath)
+	// Get file info first
+	fileInfo, err := os.Stat(filePath)
 	if err != nil {
-		ui.PrintError("x", fmt.Sprintf("failed to read file: %v", err))
+		ui.PrintError("x", fmt.Sprintf("failed to stat file: %v", err))
 		fmt.Println()
-		return fmt.Errorf("failed to read file: %w", err)
+		return fmt.Errorf("failed to stat file: %w", err)
 	}
 
-	secretValue := string(fileData)
-	const maxSecretSize = 10 * 1024 * 1024
-	if len(secretValue) > maxSecretSize {
-		ui.PrintError("x", fmt.Sprintf("secret too large (max %d bytes, got %d bytes)", maxSecretSize, len(secretValue)))
+	fileSize := fileInfo.Size()
+	const maxSecretSize = 100 * 1024 * 1024 * 1024 // 100GB max with streaming
+	if fileSize > maxSecretSize {
+		ui.PrintError("x", fmt.Sprintf("file too large (max %d GB, got %.2f GB)", maxSecretSize/(1024*1024*1024), float64(fileSize)/(1024*1024*1024)))
 		fmt.Println()
-		return fmt.Errorf("secret exceeds maximum size")
+		return fmt.Errorf("file exceeds maximum size")
 	}
 
-	ui.PrintSuccess("+", fmt.Sprintf("secret loaded from file: %s", filePath))
-	ui.PrintMuted(fmt.Sprintf("  size: %d bytes", len(secretValue)))
+	// Determine if we should use streaming encryption (files > 100MB)
+	useStreaming := fileSize > 100*1024*1024
+
+	if fileSize < 1024 {
+		ui.PrintSuccess("+", fmt.Sprintf("loading file: %s (%d bytes)", filePath, fileSize))
+	} else if fileSize < 1024*1024 {
+		ui.PrintSuccess("+", fmt.Sprintf("loading file: %s (%.2f KB)", filePath, float64(fileSize)/1024))
+	} else if fileSize < 1024*1024*1024 {
+		ui.PrintSuccess("+", fmt.Sprintf("loading file: %s (%.2f MB)", filePath, float64(fileSize)/(1024*1024)))
+	} else {
+		ui.PrintSuccess("+", fmt.Sprintf("loading file: %s (%.2f GB)", filePath, float64(fileSize)/(1024*1024*1024)))
+	}
+
+	if useStreaming {
+		ui.PrintMuted("  using streaming encryption (64MB chunks) for large file...")
+	}
 	fmt.Println()
 
 	masterKey, vaultDir, err := authenticateVault()
@@ -602,14 +636,6 @@ func secretsAddFromFile(filePath string) error {
 	}
 	defer crypto.CleanupBytes(masterKey)
 
-	secretBytes := []byte(secretValue)
-	crypto.SecureBytes(secretBytes)
-	defer crypto.CleanupBytes(secretBytes)
-
-	encryptedSecret, err := crypto.EncryptSecret(secretBytes, masterKey)
-	if err != nil {
-		return fmt.Errorf("failed to encrypt secret")
-	}
 	secretName, err := crypto.ReadSecretName()
 	if err != nil {
 		return fmt.Errorf("failed to read secret name")
@@ -628,6 +654,56 @@ func secretsAddFromFile(filePath string) error {
 		}
 	}
 
+	var encryptedValue string
+
+	if useStreaming {
+		// Stream encryption for large files
+		file, err := os.Open(filePath)
+		if err != nil {
+			return fmt.Errorf("failed to open file: %w", err)
+		}
+		defer file.Close()
+
+		// Create a buffer to hold encrypted stream data
+		var encryptedBuf strings.Builder
+
+		ui.PrintInfo(">", "encrypting file in chunks (this may take a moment for large files)...")
+		fmt.Println()
+
+		_, err = crypto.EncryptStream(file, &encryptedBuf, masterKey)
+		if err != nil {
+			return fmt.Errorf("failed to encrypt file: %w", err)
+		}
+
+		// Convert to hex
+		encryptedBytes := []byte(encryptedBuf.String())
+		encryptedValue = fmt.Sprintf("%x", encryptedBytes)
+		
+		ui.PrintSuccess("+", "file encrypted successfully")
+		fmt.Println()
+	} else {
+		// Standard encryption for smaller files
+		fileData, err := os.ReadFile(filePath)
+		if err != nil {
+			ui.PrintError("x", fmt.Sprintf("failed to read file: %v", err))
+			fmt.Println()
+			return fmt.Errorf("failed to read file: %w", err)
+		}
+
+		secretBytes := fileData
+		// Only lock memory for small files (< 10MB) to avoid quota issues on Windows
+		if len(secretBytes) < 10*1024*1024 {
+			crypto.SecureBytes(secretBytes)
+			defer crypto.CleanupBytes(secretBytes)
+		}
+
+		encryptedSecret, err := crypto.EncryptSecret(secretBytes, masterKey)
+		if err != nil {
+			return fmt.Errorf("failed to encrypt secret")
+		}
+		encryptedValue = fmt.Sprintf("%x", encryptedSecret)
+	}
+
 	vault, err := storage.LoadVaultFromDir(vaultDir)
 	if err != nil {
 		audit.LogEventForVault(vaultDir, currentUsername, "add", secretName, false, err.Error(), masterKey)
@@ -638,13 +714,13 @@ func secretsAddFromFile(filePath string) error {
 	existing, exists := vault.SecretsMetadata[secretName]
 	if exists {
 		vault.SecretsMetadata[secretName] = storage.SecretMetadata{
-			EncryptedValue: fmt.Sprintf("%x", encryptedSecret),
+			EncryptedValue: encryptedValue,
 			CreatedAt:      existing.CreatedAt,
 			UpdatedAt:      now,
 		}
 	} else {
 		vault.SecretsMetadata[secretName] = storage.SecretMetadata{
-			EncryptedValue: fmt.Sprintf("%x", encryptedSecret),
+			EncryptedValue: encryptedValue,
 			CreatedAt:      now,
 			UpdatedAt:      now,
 		}
@@ -678,8 +754,8 @@ func secretsAddFromFile(filePath string) error {
 	}
 
 	fmt.Println()
-	ui.PrintTip("tip: name secrets like env vars (e.g., DATABASE_URL, API_KEY)")
-	ui.PrintTip("     then use: secrets env run -- <your-command>")
+	ui.PrintTip("tip: use 'secrets restore' to decrypt the file back to disk when needed")
+	ui.PrintTip("     use 'secrets wipe' to securely delete restored files")
 	fmt.Println()
 	return nil
 }
@@ -1746,6 +1822,265 @@ func vaultInfo() error {
 		ui.PrintTip("tip: use 'secrets init' to initialize this vault")
 	}
 	
+	fmt.Println()
+	return nil
+}
+
+func secretsRestore(args []string) error {
+	ui.PrintTitle("restoring secret to file")
+	fmt.Println()
+
+	if len(args) < 1 {
+		ui.PrintError("x", "usage: secrets restore <name> [--output <path>]")
+		return nil
+	}
+
+	secretName := args[0]
+	var outputPath string
+
+	for i := 1; i < len(args); i++ {
+		if args[i] == "--output" && i+1 < len(args) {
+			outputPath = args[i+1]
+			break
+		}
+	}
+
+	if err := storage.CheckRateLimit(); err != nil {
+		return err
+	}
+
+	ui.PrintSuccess(">", fmt.Sprintf("restoring: %s", secretName))
+	fmt.Println()
+
+	masterKey, vaultDir, err := authenticateVault()
+	if err != nil {
+		return err
+	}
+	defer crypto.CleanupBytes(masterKey)
+
+	// Check access control for multi-user mode
+	if useGroupVault {
+		if err := promptForUsername(); err != nil {
+			return err
+		}
+		canAccess, err := multiuser.UserCanAccessSecret(currentUsername, secretName)
+		if err != nil {
+			return fmt.Errorf("failed to check access: %w", err)
+		}
+		if !canAccess {
+			return fmt.Errorf("access denied: user '%s' does not have permission to access secret '%s'", currentUsername, secretName)
+		}
+	}
+
+	// Get encrypted secret from vault
+	vault, err := storage.LoadVaultFromDir(vaultDir)
+	if err != nil {
+		return fmt.Errorf("failed to load vault: %w", err)
+	}
+
+	metadata, exists := vault.SecretsMetadata[secretName]
+	if !exists {
+		return fmt.Errorf("secret '%s' not found", secretName)
+	}
+
+	// Decode the hex-encoded encrypted value
+	encryptedBytes := make([]byte, len(metadata.EncryptedValue)/2)
+	_, err = fmt.Sscanf(metadata.EncryptedValue, "%x", &encryptedBytes)
+	if err != nil {
+		return fmt.Errorf("failed to decode secret: %w", err)
+	}
+
+	// Check if this is a streamed file
+	isStreamed := crypto.IsStreamEncrypted(encryptedBytes)
+
+	// If no output path specified, prompt for it
+	if outputPath == "" {
+		ui.PrintPrompt("enter output path (or press Enter for current directory): ")
+		scanner := bufio.NewScanner(os.Stdin)
+		if scanner.Scan() {
+			outputPath = strings.TrimSpace(scanner.Text())
+		}
+
+		// If still empty, use current directory with secret name as filename
+		if outputPath == "" {
+			cwd, err := os.Getwd()
+			if err != nil {
+				return fmt.Errorf("failed to get current directory: %w", err)
+			}
+			// Convert secret name to lowercase filename
+			filename := strings.ToLower(strings.ReplaceAll(secretName, "_", "-"))
+			outputPath = filepath.Join(cwd, filename)
+			ui.PrintMuted(fmt.Sprintf("  using default path: %s", outputPath))
+			fmt.Println()
+		}
+	}
+
+	// Check if file already exists
+	if _, err := os.Stat(outputPath); err == nil {
+		ui.PrintWarning("!", fmt.Sprintf("file already exists: %s", outputPath))
+		ui.PrintPrompt("overwrite? (yes/no): ")
+		var confirm string
+		fmt.Scanln(&confirm)
+		if confirm != "yes" && confirm != "y" {
+			ui.PrintMuted("restore cancelled")
+			fmt.Println()
+			return nil
+		}
+	}
+
+	// Decrypt and write the secret to file
+	var bytesWritten int64
+	
+	if isStreamed {
+		ui.PrintInfo(">", "decrypting streamed file...")
+		fmt.Println()
+		
+		// Create output file
+		outFile, err := os.OpenFile(outputPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+		if err != nil {
+			audit.LogEventForVault(vaultDir, currentUsername, "restore", secretName, false, err.Error(), masterKey)
+			return fmt.Errorf("failed to create output file: %w", err)
+		}
+		defer outFile.Close()
+
+		// Create reader from encrypted bytes
+		encryptedReader := strings.NewReader(string(encryptedBytes))
+		
+		// Decrypt stream directly to file
+		bytesWritten, err = crypto.DecryptStream(encryptedReader, outFile, masterKey)
+		if err != nil {
+			audit.LogEventForVault(vaultDir, currentUsername, "restore", secretName, false, err.Error(), masterKey)
+			return fmt.Errorf("failed to decrypt streamed file: %w", err)
+		}
+	} else {
+		// Standard decryption for smaller files
+		secret, err := crypto.DecryptSecret(encryptedBytes, masterKey)
+		if err != nil {
+			audit.LogEventForVault(vaultDir, currentUsername, "restore", secretName, false, err.Error(), masterKey)
+			return fmt.Errorf("failed to decrypt secret: %w", err)
+		}
+		crypto.SecureBytes(secret)
+		defer crypto.CleanupBytes(secret)
+
+		// Write decrypted secret to file
+		if err := os.WriteFile(outputPath, secret, 0600); err != nil {
+			audit.LogEventForVault(vaultDir, currentUsername, "restore", secretName, false, err.Error(), masterKey)
+			return fmt.Errorf("failed to write file: %w", err)
+		}
+		bytesWritten = int64(len(secret))
+	}
+
+	audit.LogEventForVault(vaultDir, currentUsername, "restore", secretName, true, "", masterKey)
+
+	fmt.Println()
+	ui.PrintSuccess("+", fmt.Sprintf("secret '%s' restored to: %s", secretName, outputPath))
+	if bytesWritten < 1024 {
+		ui.PrintMuted(fmt.Sprintf("  size: %d bytes", bytesWritten))
+	} else if bytesWritten < 1024*1024 {
+		ui.PrintMuted(fmt.Sprintf("  size: %.2f KB", float64(bytesWritten)/1024))
+	} else if bytesWritten < 1024*1024*1024 {
+		ui.PrintMuted(fmt.Sprintf("  size: %.2f MB", float64(bytesWritten)/(1024*1024)))
+	} else {
+		ui.PrintMuted(fmt.Sprintf("  size: %.2f GB", float64(bytesWritten)/(1024*1024*1024)))
+	}
+	fmt.Println()
+	ui.PrintWarning("!", "remember to securely delete this file when done!")
+	ui.PrintTip("tip: use 'secrets wipe <path>' to securely delete the file")
+	fmt.Println()
+	return nil
+}
+
+func secretsWipeFile(filePath string) error {
+	ui.PrintTitle("securely wiping file")
+	fmt.Println()
+
+	fileInfo, err := os.Stat(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("file does not exist: %s", filePath)
+		}
+		return fmt.Errorf("failed to stat file: %w", err)
+	}
+
+	if fileInfo.IsDir() {
+		return fmt.Errorf("path is a directory, not a file: %s", filePath)
+	}
+
+	fileSize := fileInfo.Size()
+	ui.PrintWarning("!", fmt.Sprintf("this will securely delete: %s", filePath))
+	if fileSize < 1024 {
+		ui.PrintMuted(fmt.Sprintf("  size: %d bytes", fileSize))
+	} else if fileSize < 1024*1024 {
+		ui.PrintMuted(fmt.Sprintf("  size: %.2f KB", float64(fileSize)/1024))
+	} else {
+		ui.PrintMuted(fmt.Sprintf("  size: %.2f MB", float64(fileSize)/(1024*1024)))
+	}
+	fmt.Println()
+
+	ui.PrintPrompt("confirm deletion? (yes/no): ")
+	var confirm string
+	fmt.Scanln(&confirm)
+
+	if confirm != "yes" && confirm != "y" {
+		ui.PrintMuted("deletion cancelled")
+		fmt.Println()
+		return nil
+	}
+
+	file, err := os.OpenFile(filePath, os.O_WRONLY, 0600)
+	if err != nil {
+		return fmt.Errorf("failed to open file for wiping: %w", err)
+	}
+	defer file.Close()
+
+	ui.PrintInfo(">", "overwriting file with random data...")
+	fmt.Println()
+
+	bufferSize := 1024 * 1024
+	if fileSize < int64(bufferSize) {
+		bufferSize = int(fileSize)
+	}
+	buffer := make([]byte, bufferSize)
+
+	for pass := 1; pass <= 3; pass++ {
+		ui.PrintMuted(fmt.Sprintf("  pass %d/3...", pass))
+		
+		if _, err := file.Seek(0, 0); err != nil {
+			return fmt.Errorf("failed to seek file: %w", err)
+		}
+
+		remaining := fileSize
+		for remaining > 0 {
+			writeSize := int64(bufferSize)
+			if remaining < writeSize {
+				writeSize = remaining
+			}
+
+			if _, err := io.ReadFull(rand.Reader, buffer[:writeSize]); err != nil {
+				return fmt.Errorf("failed to generate random data: %w", err)
+			}
+
+			if _, err := file.Write(buffer[:writeSize]); err != nil {
+				return fmt.Errorf("failed to overwrite file: %w", err)
+			}
+
+			remaining -= writeSize
+		}
+
+		if err := file.Sync(); err != nil {
+			return fmt.Errorf("failed to sync file: %w", err)
+		}
+	}
+
+	file.Close()
+
+	if err := os.Remove(filePath); err != nil {
+		return fmt.Errorf("failed to remove file: %w", err)
+	}
+
+	fmt.Println()
+	ui.PrintSuccess("+", "file securely wiped and deleted!")
+	ui.PrintMuted(fmt.Sprintf("  removed: %s", filePath))
 	fmt.Println()
 	return nil
 }

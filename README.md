@@ -39,7 +39,7 @@ secrets manager stores your sensitive data (api keys, tokens, passwords, connect
 ### audit logging
 
 - encrypted audit trail of all operations
-- tracks user, action, timestamp, ip address, and success/failure
+- tracks user, action, timestamp, local ip, public ip, and success/failure
 - view history with the history command
 - retains last 10,000 events
 
@@ -160,6 +160,44 @@ secrets env run -- ./your-binary
 
 all your secrets are automatically injected as environment variables.
 
+#### store and restore large files (databases, keys, assets)
+
+store large files (up to 100GB) like database files, SSH keys, or other assets:
+
+```bash
+# store a file as a secret
+secrets add --file database.db
+
+# files over 100MB automatically use streaming encryption (64MB chunks)
+# this keeps memory usage low even for very large files
+
+# restore the file when needed
+secrets restore DATABASE_DB
+
+# restore to a specific path
+secrets restore DATABASE_DB --output ./restored/database.db
+
+# securely wipe the file when done (3-pass overwrite + deletion)
+secrets wipe ./restored/database.db
+```
+
+perfect for:
+- database dumps and backups (up to 100GB)
+- ssl/tls certificates and private keys
+- ssh keys
+- application binaries
+- large configuration files
+- encrypted backups
+- vm images or container layers
+
+**streaming encryption**: files larger than 100MB are automatically encrypted in 64MB chunks, meaning:
+- memory usage stays constant regardless of file size
+- can handle 10GB+ files without loading everything into RAM
+- each chunk is independently encrypted with AES-256-GCM
+- decryption is also streamed, writing directly to disk
+
+the `wipe` command performs 3-pass random overwriting before deletion to prevent data recovery.
+
 ### backup and recovery
 
 #### export secrets
@@ -241,7 +279,9 @@ groups control access to secrets based on name prefixes. for example, a group wi
 secrets history
 ```
 
-displays the last 50 audit events showing user, action, secret name, timestamp, ip address, and success/failure status.
+displays the last 50 audit events showing user, action, secret name, timestamp, local IP, public IP, and success/failure status.
+
+audit logs track both local network IP and public IP to help identify access patterns, especially useful in multi-user environments where team members may be accessing from different locations.
 
 ## why use this over traditional .env files?
 
@@ -377,9 +417,13 @@ these directories require administrator/root privileges to write, preventing una
 
 6. **clipboard safety**: when copying secrets to clipboard with `--clip`, the clipboard is only cleared if it still contains the secret after 30 seconds (prevents clearing user's new clipboard content).
 
-7. **audit logging**: all operations are logged with encryption. audit events include timestamp, user, action, secret name, ip address, and success/failure status. logs are encrypted with the master key and stored separately from the vault.
+7. **audit logging**: all operations are logged with encryption. audit events include timestamp, user, action, secret name, local ip, public ip, and success/failure status. logs are encrypted with the master key and stored separately from the vault. public ip tracking helps identify access patterns in multi-user scenarios.
 
 8. **automatic backups**: encrypted backups are created automatically after add/delete operations. backups include vault metadata and timestamp, with automatic cleanup keeping only the last 10 backups.
+
+9. **large file support**: store files up to 100GB. files over 100MB use streaming encryption (64MB chunks) to keep memory usage constant. the `restore` command decrypts to disk and `wipe` provides secure 3-pass deletion.
+
+10. **async public ip fetching**: public ip addresses are fetched asynchronously during audit logging to avoid blocking operations, with a 3-second timeout per service.
 
 ### dependencies
 

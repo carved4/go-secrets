@@ -45,13 +45,18 @@ func GetAuditLogPathForVault(vaultDir string) string {
 func LogEventForVault(vaultDir string, user string, action string, secret string, success bool, errorMsg string, masterKey []byte) error {
 	auditLogPath := GetAuditLogPathForVault(vaultDir)
 	
+	publicIPChan := make(chan string, 1)
+	go func() {
+		publicIPChan <- getPublicIP()
+	}()
+	
 	event := AuditEvent{
 		Timestamp: time.Now().UTC(),
 		User:      user,
 		Action:    action,
 		Secret:    secret,
 		IP:        getLocalIP(),
-		PublicIP:  getPublicIP(),
+		PublicIP:  <-publicIPChan,
 		Success:   success,
 		Error:     errorMsg,
 	}
@@ -168,7 +173,6 @@ func getLocalIP() string {
 }
 
 func getPublicIP() string {
-	// Try multiple services in case one is down
 	services := []string{
 		"https://api.ipify.org",
 		"https://ifconfig.me/ip",
@@ -199,13 +203,18 @@ func getPublicIP() string {
 }
 
 func LogEvent(user string, action string, secret string, success bool, errorMsg string, masterKey []byte) error {
+	publicIPChan := make(chan string, 1)
+	go func() {
+		publicIPChan <- getPublicIP()
+	}()
+	
 	event := AuditEvent{
 		Timestamp: time.Now().UTC(),
 		User:      user,
 		Action:    action,
 		Secret:    secret,
 		IP:        getLocalIP(),
-		PublicIP:  getPublicIP(),
+		PublicIP:  <-publicIPChan,
 		Success:   success,
 		Error:     errorMsg,
 	}
