@@ -14,6 +14,8 @@ secrets manager stores your sensitive data (api keys, tokens, passwords, connect
 
 ### core features
 
+- **multiple vaults**: create separate vaults for different contexts (personal, work, projects)
+- **easy vault switching**: switch between vaults with a single command
 - store secrets from your clipboard with one command
 - retrieve secrets to clipboard or display them securely
 - inject all secrets as environment variables into any command
@@ -54,6 +56,31 @@ on windows, run as administrator. on linux/macos, run with sudo.
 ## usage
 
 ### solo vault (default)
+
+#### create and manage vaults
+
+```bash
+# create a new vault
+secrets vault create
+
+# list all vaults
+secrets vault list
+
+# switch to a different vault
+secrets vault switch work
+
+# show current vault info
+secrets vault info
+
+# delete a vault
+secrets vault delete old-vault
+```
+
+each vault is completely independent with its own:
+- secrets
+- encryption keys (derived from same passphrase but cryptographically independent)
+- audit logs
+- backups
 
 #### initialize your vault
 
@@ -248,29 +275,30 @@ displays the last 50 audit events showing user, action, secret name, timestamp, 
 
 ### architecture
 
-#### solo vault
+#### solo vault architecture
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                  user password                   │
-│                  (pbkdf2 600k)                   │
+│           user password + vault name             │
+│         (mixed into pbkdf2 600k for              │
+│          vault-specific key derivation)          │
 └────────────────────┬────────────────────────────┘
                      │
                      ▼
 ┌─────────────────────────────────────────────────┐
-│              derived key (32 bytes)              │
+│         vault-specific derived key               │
 │         (used to encrypt master key)             │
 └────────────────────┬────────────────────────────┘
                      │
                      ▼
 ┌─────────────────────────────────────────────────┐
-│  encrypted master key + salt → system keyring   │
-│    (windows credential manager / keychain)       │
+│  encrypted master key + salt → keyring.json     │
+│        (stored in vault directory)               │
 └────────────────────┬────────────────────────────┘
                      │
                      ▼
 ┌─────────────────────────────────────────────────┐
-│         master key (32 bytes, decrypted)         │
+│      vault-specific master key (decrypted)       │
 │       (used to encrypt/decrypt secrets)          │
 └────────────────────┬────────────────────────────┘
                      │
@@ -280,6 +308,11 @@ displays the last 50 audit events showing user, action, secret name, timestamp, 
 │     (stored in admin-protected directory)        │
 └─────────────────────────────────────────────────┘
 ```
+
+**key insight**: same passphrase unlocks all vaults, but each vault has a cryptographically independent master key because the vault name is mixed into the key derivation function. this means:
+- convenience: remember one passphrase
+- security: compromising one vault doesn't compromise others
+- flexibility: each vault can be backed up, rotated, and managed independently
 
 #### multi-user vault
 
@@ -313,16 +346,20 @@ each user has their own encrypted copy of the master key. groups define which us
 ### storage locations
 
 #### windows
-- solo vault: `C:\ProgramData\secrets-manager\vault\vault.json`
-- group vault: `C:\ProgramData\secrets-manager\vault\vault-group.json`
-- audit log: `C:\ProgramData\secrets-manager\vault\audit.json`
-- backups: `C:\ProgramData\secrets-manager\vault\backups\`
+- vault config: `C:\ProgramData\secrets-manager\vault-config.json`
+- vaults: `C:\ProgramData\secrets-manager\vaults\<vault-name>\`
+  - vault file: `vault.json`
+  - keyring: `keyring.json`
+  - audit log: `audit.json`
+  - backups: `backups\`
 
 #### linux/macos
-- solo vault: `/var/lib/secrets-manager/vault.json`
-- group vault: `/var/lib/secrets-manager/vault-group.json`
-- audit log: `/var/lib/secrets-manager/audit.json`
-- backups: `/var/lib/secrets-manager/backups/`
+- vault config: `/var/lib/secrets-manager/vault-config.json`
+- vaults: `/var/lib/secrets-manager/vaults/<vault-name>/`
+  - vault file: `vault.json`
+  - keyring: `keyring.json`
+  - audit log: `audit.json`
+  - backups: `backups/`
 
 these directories require administrator/root privileges to write, preventing unauthorized modification.
 

@@ -19,10 +19,75 @@ import (
 	"github.com/carved4/go-secrets/internal/privileges"
 	"github.com/carved4/go-secrets/internal/storage"
 	"github.com/carved4/go-secrets/internal/ui"
+	"github.com/carved4/go-secrets/internal/vaultmanager"
 )
 
 var useGroupVault bool
 var currentUsername string = "default"
+
+func getActiveVaultContext() (vaultName string, vaultDir string, err error) {
+	vaultName, err = vaultmanager.GetActiveVault()
+	if err != nil {
+		return "", "", err
+	}
+	vaultDir = vaultmanager.GetVaultDir(vaultName)
+	return vaultName, vaultDir, nil
+}
+
+func authenticateVault() (masterKey []byte, vaultDir string, err error) {
+	vaultName, vaultDir, err := getActiveVaultContext()
+	if err != nil {
+		return nil, "", err
+	}
+
+	password, err := crypto.ReadUserPass()
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to read password: %w", err)
+	}
+	defer crypto.CleanupBytes(password)
+
+	encryptedMasterKey, salt, err := keyring.LoadVaultKeyring(vaultDir)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to load keyring: %w", err)
+	}
+
+	// Check if this is a legacy vault (migrated from old system)
+	vaultInfo, err := vaultmanager.GetVaultInfo(vaultName)
+	if err != nil {
+		// Auto-register vault if keyring exists but vault isn't in config (backwards compatibility)
+		if keyring.VaultKeyringExists(vaultDir) {
+			if regErr := vaultmanager.CreateVault(vaultName, vaultmanager.VaultTypeSolo, ""); regErr == nil {
+				vaultInfo, err = vaultmanager.GetVaultInfo(vaultName)
+			}
+		}
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to get vault info: %w", err)
+		}
+	}
+
+	var derivedKey []byte
+	if vaultInfo.LegacyKeyring {
+		// Use old key derivation (without vault context)
+		derivedKey, _, err = crypto.DeriveKeyFromUserPass([]byte(password), salt)
+	} else {
+		// Use new vault-context key derivation
+		derivedKey, _, err = crypto.DeriveVaultKey([]byte(password), vaultName, salt)
+	}
+	
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to derive key: %w", err)
+	}
+	defer crypto.CleanupBytes(derivedKey)
+
+	masterKey, err = crypto.DecryptMasterKey(encryptedMasterKey, derivedKey)
+	if err != nil {
+		storage.RecordFailedAttempt()
+		return nil, "", fmt.Errorf("failed to decrypt master key - incorrect password")
+	}
+
+	storage.ResetRateLimit()
+	return masterKey, vaultDir, nil
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -64,9 +129,10 @@ func runInteractiveMode() {
 
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
-		prompt := "secrets> "
+		activeVault, _ := vaultmanager.GetActiveVault()
+		prompt := fmt.Sprintf("secrets[%s]> ", activeVault)
 		if useGroupVault {
-			prompt = "secrets[group]> "
+			prompt = fmt.Sprintf("secrets[%s:group]> ", activeVault)
 		}
 		ui.PrintPrompt(prompt)
 		if !scanner.Scan() {
@@ -222,6 +288,12 @@ func executeCommand(args []string) error {
 		return secretsHistory()
 	case "rotate":
 		return secretsRotate(args[1:])
+	case "vault":
+		if len(args) < 2 {
+			ui.PrintError("x", "usage: secrets vault <create|list|switch|delete|info>")
+			return nil
+		}
+		return handleVaultCommand(args[1:])
 	default:
 		ui.PrintError("x", fmt.Sprintf("unknown command: %s", command))
 		fmt.Println()
@@ -257,6 +329,14 @@ func printUsage() {
 	ui.PrintListItem("  >", "history        view audit log history")
 	ui.PrintListItem("  >", "rotate [name]  rotate all secrets or a specific secret")
 	fmt.Println()
+	ui.PrintInfo("*", "vault management:")
+	fmt.Println()
+	ui.PrintListItem("  >", "vault create   create a new vault")
+	ui.PrintListItem("  >", "vault list     list all vaults")
+	ui.PrintListItem("  >", "vault switch <name>  switch to a different vault")
+	ui.PrintListItem("  >", "vault delete <name>  delete a vault")
+	ui.PrintListItem("  >", "vault info     show active vault information")
+	fmt.Println()
 	ui.PrintInfo("*", "multi-user commands (use with --group):")
 	fmt.Println()
 	ui.PrintListItem("  >", "user add       add a new user to vault")
@@ -285,6 +365,13 @@ func secretsInit(useGroups bool) error {
 	ui.PrintTitle("initializing vault")
 	fmt.Println()
 
+	activeVault, err := vaultmanager.GetActiveVault()
+	if err != nil {
+		return err
+	}
+
+	vaultDir := vaultmanager.GetVaultDir(activeVault)
+
 	if useGroups {
 		ui.PrintMuted("setting up multi-user vault with groups...")
 	} else {
@@ -292,12 +379,23 @@ func secretsInit(useGroups bool) error {
 	}
 	fmt.Println()
 
-	vaultPath := storage.GetVaultPathForMode(useGroups)
-	if _, err := os.Stat(vaultPath); err == nil {
+	if keyring.VaultKeyringExists(vaultDir) {
+		return fmt.Errorf("vault '%s' is already initialized", activeVault)
+	}
+
+	// Ensure vault is registered in config (needed for GetVaultInfo during authentication)
+	exists, err := vaultmanager.VaultExists(activeVault)
+	if err != nil {
+		return fmt.Errorf("failed to check vault existence: %w", err)
+	}
+	if !exists {
+		vaultType := vaultmanager.VaultTypeSolo
 		if useGroups {
-			return fmt.Errorf("group vault already initialized at %s", vaultPath)
+			vaultType = vaultmanager.VaultTypeGroup
 		}
-		return fmt.Errorf("solo vault already initialized at %s", vaultPath)
+		if err := vaultmanager.CreateVault(activeVault, vaultType, ""); err != nil {
+			return fmt.Errorf("failed to register vault: %w", err)
+		}
 	}
 
 	if useGroups {
@@ -315,27 +413,28 @@ func secretsInit(useGroups bool) error {
 		return fmt.Errorf("could not generate master key: %w", err)
 	}
 
-	derivedKey, salt, err := crypto.DeriveKeyFromUserPass([]byte(userPass), nil)
+	derivedKey, salt, err := crypto.DeriveVaultKey([]byte(userPass), activeVault, nil)
 	if err != nil {
 		return fmt.Errorf("could not derive key from user pass: %w", err)
 	}
+	defer crypto.CleanupBytes(derivedKey)
 
 	encryptedMasterKey, err := crypto.EncryptMasterKey(masterKey, derivedKey)
 	if err != nil {
 		return fmt.Errorf("could not encrypt master key: %w", err)
 	}
 
-	if err := keyring.StoreEncryptedMasterKey(encryptedMasterKey, salt); err != nil {
-		return fmt.Errorf("could not store in keyring: %w", err)
+	if err := keyring.StoreVaultKeyring(vaultDir, encryptedMasterKey, salt); err != nil {
+		return fmt.Errorf("could not store keyring: %w", err)
 	}
 
-	if err := storage.InitVault(); err != nil {
+	if err := storage.InitVaultInDir(vaultDir); err != nil {
 		return fmt.Errorf("could not initialize vault: %w", err)
 	}
 
 	fmt.Println()
-	ui.PrintSuccess("+", "vault initialized successfully!")
-	ui.PrintMuted(fmt.Sprintf("  vault location: %s", vaultPath))
+	ui.PrintSuccess("+", fmt.Sprintf("vault '%s' initialized successfully!", activeVault))
+	ui.PrintMuted(fmt.Sprintf("  vault location: %s", vaultDir))
 	fmt.Println()
 	return nil
 }
@@ -396,29 +495,11 @@ func secretsAdd() error {
 	ui.PrintSuccess("+", "secret loaded from clipboard")
 	fmt.Println()
 
-	password, err := crypto.ReadUserPass()
+	masterKey, vaultDir, err := authenticateVault()
 	if err != nil {
-		return fmt.Errorf("failed to read password")
-	}
-	defer crypto.CleanupBytes(password)
-	encryptedMasterKey, salt, err := keyring.LoadEncryptedMasterKey()
-	if err != nil {
-		return fmt.Errorf("failed to load encrypted master key from vault")
-	}
-	derivedKey, _, err := crypto.DeriveKeyFromUserPass([]byte(password), salt)
-	if err != nil {
-		return fmt.Errorf("failed to derive key from user secret")
-	}
-	defer crypto.CleanupBytes(derivedKey)
-
-	masterKey, err := crypto.DecryptMasterKey(encryptedMasterKey, derivedKey)
-	if err != nil {
-		storage.RecordFailedAttempt()
-		return fmt.Errorf("failed to decrypt master key - incorrect password")
+		return err
 	}
 	defer crypto.CleanupBytes(masterKey)
-
-	storage.ResetRateLimit()
 
 	secretBytes := []byte(secretValue)
 	crypto.SecureBytes(secretBytes)
@@ -428,12 +509,12 @@ func secretsAdd() error {
 	if err != nil {
 		return fmt.Errorf("failed to encrypt secret")
 	}
+	
 	secretName, err := crypto.ReadSecretName()
 	if err != nil {
 		return fmt.Errorf("failed to read secret name")
 	}
 
-	// Check access control for multi-user mode
 	if useGroupVault {
 		if err := promptForUsername(); err != nil {
 			return err
@@ -447,18 +528,36 @@ func secretsAdd() error {
 		}
 	}
 
-	if err := storage.AddSecretWithMode(secretName, encryptedSecret, useGroupVault); err != nil {
-		audit.LogEvent(currentUsername, "add", secretName, false, err.Error(), masterKey)
-		return fmt.Errorf("failed to store secret in vault")
+	vault, err := storage.LoadVaultFromDir(vaultDir)
+	if err != nil {
+		audit.LogEventForVault(vaultDir, currentUsername, "add", secretName, false, err.Error(), masterKey)
+		return fmt.Errorf("failed to load vault: %w", err)
+	}
+
+	now := time.Now()
+	existing, exists := vault.SecretsMetadata[secretName]
+	if exists {
+		vault.SecretsMetadata[secretName] = storage.SecretMetadata{
+			EncryptedValue: fmt.Sprintf("%x", encryptedSecret),
+			CreatedAt:      existing.CreatedAt,
+			UpdatedAt:      now,
+		}
+	} else {
+		vault.SecretsMetadata[secretName] = storage.SecretMetadata{
+			EncryptedValue: fmt.Sprintf("%x", encryptedSecret),
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+	}
+
+	if err := storage.SaveVaultToDir(vaultDir, vault); err != nil {
+		audit.LogEventForVault(vaultDir, currentUsername, "add", secretName, false, err.Error(), masterKey)
+		return fmt.Errorf("failed to save vault: %w", err)
 	}
 
 	clipboard.WriteAll("")
 
-	if err := backup.CreateAutoBackup(password); err != nil {
-		ui.PrintWarning("!", fmt.Sprintf("warning: auto-backup failed: %v", err))
-	}
-
-	audit.LogEvent(currentUsername, "add", secretName, true, "", masterKey)
+	audit.LogEventForVault(vaultDir, currentUsername, "add", secretName, true, "", masterKey)
 
 	fmt.Println()
 	ui.PrintSuccess("+", fmt.Sprintf("secret '%s' added successfully!", secretName))
@@ -497,29 +596,11 @@ func secretsAddFromFile(filePath string) error {
 	ui.PrintMuted(fmt.Sprintf("  size: %d bytes", len(secretValue)))
 	fmt.Println()
 
-	password, err := crypto.ReadUserPass()
+	masterKey, vaultDir, err := authenticateVault()
 	if err != nil {
-		return fmt.Errorf("failed to read password")
-	}
-	defer crypto.CleanupBytes(password)
-	encryptedMasterKey, salt, err := keyring.LoadEncryptedMasterKey()
-	if err != nil {
-		return fmt.Errorf("failed to load encrypted master key from vault")
-	}
-	derivedKey, _, err := crypto.DeriveKeyFromUserPass([]byte(password), salt)
-	if err != nil {
-		return fmt.Errorf("failed to derive key from user secret")
-	}
-	defer crypto.CleanupBytes(derivedKey)
-
-	masterKey, err := crypto.DecryptMasterKey(encryptedMasterKey, derivedKey)
-	if err != nil {
-		storage.RecordFailedAttempt()
-		return fmt.Errorf("failed to decrypt master key - incorrect password")
+		return err
 	}
 	defer crypto.CleanupBytes(masterKey)
-
-	storage.ResetRateLimit()
 
 	secretBytes := []byte(secretValue)
 	crypto.SecureBytes(secretBytes)
@@ -547,16 +628,34 @@ func secretsAddFromFile(filePath string) error {
 		}
 	}
 
-	if err := storage.AddSecretWithMode(secretName, encryptedSecret, useGroupVault); err != nil {
-		audit.LogEvent(currentUsername, "add", secretName, false, err.Error(), masterKey)
-		return fmt.Errorf("failed to store secret in vault")
+	vault, err := storage.LoadVaultFromDir(vaultDir)
+	if err != nil {
+		audit.LogEventForVault(vaultDir, currentUsername, "add", secretName, false, err.Error(), masterKey)
+		return fmt.Errorf("failed to load vault: %w", err)
 	}
 
-	if err := backup.CreateAutoBackup(password); err != nil {
-		ui.PrintWarning("!", fmt.Sprintf("warning: auto-backup failed: %v", err))
+	now := time.Now()
+	existing, exists := vault.SecretsMetadata[secretName]
+	if exists {
+		vault.SecretsMetadata[secretName] = storage.SecretMetadata{
+			EncryptedValue: fmt.Sprintf("%x", encryptedSecret),
+			CreatedAt:      existing.CreatedAt,
+			UpdatedAt:      now,
+		}
+	} else {
+		vault.SecretsMetadata[secretName] = storage.SecretMetadata{
+			EncryptedValue: fmt.Sprintf("%x", encryptedSecret),
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
 	}
 
-	audit.LogEvent(currentUsername, "add", secretName, true, "", masterKey)
+	if err := storage.SaveVaultToDir(vaultDir, vault); err != nil {
+		audit.LogEventForVault(vaultDir, currentUsername, "add", secretName, false, err.Error(), masterKey)
+		return fmt.Errorf("failed to save vault: %w", err)
+	}
+
+	audit.LogEventForVault(vaultDir, currentUsername, "add", secretName, true, "", masterKey)
 
 	fmt.Println()
 	ui.PrintSuccess("+", fmt.Sprintf("secret '%s' added successfully!", secretName))
@@ -603,32 +702,11 @@ func secretsGet(secretName string, useClipboard bool) error {
 		return err
 	}
 
-	password, err := crypto.ReadUserPass()
+	masterKey, vaultDir, err := authenticateVault()
 	if err != nil {
-		return fmt.Errorf("failed to read password: %w", err)
-	}
-	defer crypto.CleanupBytes(password)
-
-	// Load and decrypt master key
-	encryptedMasterKey, salt, err := keyring.LoadEncryptedMasterKey()
-	if err != nil {
-		return fmt.Errorf("failed to load encrypted master key: %w", err)
-	}
-
-	derivedKey, _, err := crypto.DeriveKeyFromUserPass([]byte(password), salt)
-	if err != nil {
-		return fmt.Errorf("failed to derive key: %w", err)
-	}
-	defer crypto.CleanupBytes(derivedKey)
-
-	masterKey, err := crypto.DecryptMasterKey(encryptedMasterKey, derivedKey)
-	if err != nil {
-		storage.RecordFailedAttempt()
-		return fmt.Errorf("failed to decrypt master key - incorrect password")
+		return err
 	}
 	defer crypto.CleanupBytes(masterKey)
-
-	storage.ResetRateLimit()
 
 	// Check access control for multi-user mode
 	if useGroupVault {
@@ -645,21 +723,33 @@ func secretsGet(secretName string, useClipboard bool) error {
 	}
 
 	// Get encrypted secret from vault
-	encryptedSecret, err := storage.GetSecretWithMode(secretName, useGroupVault)
+	vault, err := storage.LoadVaultFromDir(vaultDir)
 	if err != nil {
-		return fmt.Errorf("failed to get secret: %w", err)
+		return fmt.Errorf("failed to load vault: %w", err)
+	}
+
+	metadata, exists := vault.SecretsMetadata[secretName]
+	if !exists {
+		return fmt.Errorf("secret '%s' not found", secretName)
+	}
+
+	// Decode the hex-encoded encrypted value
+	encryptedBytes := make([]byte, len(metadata.EncryptedValue)/2)
+	_, err = fmt.Sscanf(metadata.EncryptedValue, "%x", &encryptedBytes)
+	if err != nil {
+		return fmt.Errorf("failed to decode secret: %w", err)
 	}
 
 	// Decrypt the secret
-	secret, err := crypto.DecryptSecret(encryptedSecret, masterKey)
+	secret, err := crypto.DecryptSecret(encryptedBytes, masterKey)
 	if err != nil {
-		audit.LogEvent(currentUsername, "get", secretName, false, err.Error(), masterKey)
+		audit.LogEventForVault(vaultDir, currentUsername, "get", secretName, false, err.Error(), masterKey)
 		return fmt.Errorf("failed to decrypt secret: %w", err)
 	}
 	crypto.SecureBytes(secret)
 	defer crypto.CleanupBytes(secret)
 
-	audit.LogEvent(currentUsername, "get", secretName, true, "", masterKey)
+	audit.LogEventForVault(vaultDir, currentUsername, "get", secretName, true, "", masterKey)
 
 	fmt.Println()
 
@@ -706,28 +796,42 @@ func secretsList() error {
 	ui.PrintTitle("secrets list")
 	fmt.Println()
 
-	allMetadata, err := storage.GetAllSecretsMetadata(useGroupVault)
+	vaultName, vaultDir, err := getActiveVaultContext()
+	if err != nil {
+		return err
+	}
+
+	// Check if vault is initialized
+	if !keyring.VaultKeyringExists(vaultDir) {
+		ui.PrintWarning("!", fmt.Sprintf("vault '%s' has not been initialized yet", vaultName))
+		fmt.Println()
+		ui.PrintTip("run 'secrets init' to initialize this vault")
+		fmt.Println()
+		return nil
+	}
+
+	vault, err := storage.LoadVaultFromDir(vaultDir)
 	if err != nil {
 		return fmt.Errorf("failed to list secrets: %w", err)
 	}
 
-	if len(allMetadata) == 0 {
+	if len(vault.SecretsMetadata) == 0 {
 		ui.PrintMuted("no secrets stored yet")
 		fmt.Println()
 		return nil
 	}
 
-	ui.PrintInfo("*", fmt.Sprintf("found %d secret(s):", len(allMetadata)))
+	ui.PrintInfo("*", fmt.Sprintf("found %d secret(s):", len(vault.SecretsMetadata)))
 	fmt.Println()
 
-	names := make([]string, 0, len(allMetadata))
-	for name := range allMetadata {
+	names := make([]string, 0, len(vault.SecretsMetadata))
+	for name := range vault.SecretsMetadata {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 
 	for _, name := range names {
-		metadata := allMetadata[name]
+		metadata := vault.SecretsMetadata[name]
 		age := time.Since(metadata.CreatedAt)
 		ageStr := formatDuration(age)
 
@@ -791,30 +895,11 @@ func secretsDelete(secretName string) error {
 		return err
 	}
 
-	password, err := crypto.ReadUserPass()
+	masterKey, vaultDir, err := authenticateVault()
 	if err != nil {
-		return fmt.Errorf("failed to read password: %w", err)
-	}
-	defer crypto.CleanupBytes(password)
-	encryptedMasterKey, salt, err := keyring.LoadEncryptedMasterKey()
-	if err != nil {
-		return fmt.Errorf("failed to load encrypted master key: %w", err)
-	}
-
-	derivedKey, _, err := crypto.DeriveKeyFromUserPass([]byte(password), salt)
-	if err != nil {
-		return fmt.Errorf("failed to derive key: %w", err)
-	}
-	defer crypto.CleanupBytes(derivedKey)
-
-	masterKey, err := crypto.DecryptMasterKey(encryptedMasterKey, derivedKey)
-	if err != nil {
-		storage.RecordFailedAttempt()
-		return fmt.Errorf("failed to decrypt master key - incorrect password")
+		return err
 	}
 	defer crypto.CleanupBytes(masterKey)
-
-	storage.ResetRateLimit()
 
 	// Check access control for multi-user mode
 	if useGroupVault {
@@ -830,16 +915,24 @@ func secretsDelete(secretName string) error {
 		}
 	}
 
-	if err := storage.DeleteSecretWithMode(secretName, useGroupVault); err != nil {
-		audit.LogEvent(currentUsername, "delete", secretName, false, err.Error(), masterKey)
-		return fmt.Errorf("failed to delete secret: %w", err)
+	vault, err := storage.LoadVaultFromDir(vaultDir)
+	if err != nil {
+		audit.LogEventForVault(vaultDir, currentUsername, "delete", secretName, false, err.Error(), masterKey)
+		return fmt.Errorf("failed to load vault: %w", err)
 	}
 
-	if err := backup.CreateAutoBackup(password); err != nil {
-		ui.PrintWarning("!", fmt.Sprintf("warning: auto-backup failed: %v", err))
+	if _, exists := vault.SecretsMetadata[secretName]; !exists {
+		return fmt.Errorf("secret '%s' not found", secretName)
 	}
 
-	audit.LogEvent(currentUsername, "delete", secretName, true, "", masterKey)
+	delete(vault.SecretsMetadata, secretName)
+
+	if err := storage.SaveVaultToDir(vaultDir, vault); err != nil {
+		audit.LogEventForVault(vaultDir, currentUsername, "delete", secretName, false, err.Error(), masterKey)
+		return fmt.Errorf("failed to save vault: %w", err)
+	}
+
+	audit.LogEventForVault(vaultDir, currentUsername, "delete", secretName, true, "", masterKey)
 
 	ui.PrintSuccess("+", fmt.Sprintf("secret '%s' deleted successfully", secretName))
 	fmt.Println()
@@ -877,31 +970,11 @@ func secretsEnvRun(cmdArgs []string) error {
 		return err
 	}
 
-	password, err := crypto.ReadUserPass()
+	masterKey, _, err := authenticateVault()
 	if err != nil {
-		return fmt.Errorf("failed to read password: %w", err)
-	}
-	defer crypto.CleanupBytes(password)
-
-	encryptedMasterKey, salt, err := keyring.LoadEncryptedMasterKey()
-	if err != nil {
-		return fmt.Errorf("failed to load encrypted master key: %w", err)
-	}
-
-	derivedKey, _, err := crypto.DeriveKeyFromUserPass([]byte(password), salt)
-	if err != nil {
-		return fmt.Errorf("failed to derive key: %w", err)
-	}
-	defer crypto.CleanupBytes(derivedKey)
-
-	masterKey, err := crypto.DecryptMasterKey(encryptedMasterKey, derivedKey)
-	if err != nil {
-		storage.RecordFailedAttempt()
-		return fmt.Errorf("failed to decrypt master key - incorrect password")
+		return err
 	}
 	defer crypto.CleanupBytes(masterKey)
-
-	storage.ResetRateLimit()
 
 	injector := envinjector.NewSecureEnvInjector()
 	defer injector.Cleanup()
@@ -966,34 +1039,23 @@ func secretsExport(outputFile string) error {
 		return err
 	}
 
-	password, err := crypto.ReadUserPass()
+	masterKey, vaultDir, err := authenticateVault()
 	if err != nil {
-		return fmt.Errorf("failed to read password: %w", err)
+		return err
 	}
-	defer crypto.CleanupBytes(password)
-	encryptedMasterKey, salt, err := keyring.LoadEncryptedMasterKey()
-	if err != nil {
-		return fmt.Errorf("failed to load encrypted master key: %w", err)
-	}
-
-	derivedKey, _, err := crypto.DeriveKeyFromUserPass([]byte(password), salt)
-	if err != nil {
-		return fmt.Errorf("failed to derive key: %w", err)
-	}
-	defer crypto.CleanupBytes(derivedKey)
-
-	_, err = crypto.DecryptMasterKey(encryptedMasterKey, derivedKey)
-	if err != nil {
-		storage.RecordFailedAttempt()
-		return fmt.Errorf("failed to decrypt master key - incorrect password")
-	}
-
-	storage.ResetRateLimit()
+	defer crypto.CleanupBytes(masterKey)
 
 	ui.PrintInfo(">", "creating encrypted backup...")
 	fmt.Println()
 
-	encryptedBlob, err := backup.ExportSecrets(password)
+	ui.PrintMuted("  enter a password to encrypt the export file:")
+	exportPassword, err := crypto.ReadUserPass()
+	if err != nil {
+		return fmt.Errorf("failed to read export password: %w", err)
+	}
+	defer crypto.CleanupBytes(exportPassword)
+
+	encryptedBlob, err := backup.ExportSecretsFromVault(vaultDir, exportPassword)
 	if err != nil {
 		return fmt.Errorf("failed to export secrets: %w", err)
 	}
@@ -1023,6 +1085,14 @@ func secretsImport(inputFile string) error {
 		return fmt.Errorf("failed to read import file: %w", err)
 	}
 
+	// First get the vault directory
+	activeVault, err := vaultmanager.GetActiveVault()
+	if err != nil {
+		return err
+	}
+	vaultDir := vaultmanager.GetVaultDir(activeVault)
+
+	ui.PrintMuted("  enter the password used to encrypt the backup:")
 	password, err := crypto.ReadUserPass()
 	if err != nil {
 		return fmt.Errorf("failed to read password: %w", err)
@@ -1054,7 +1124,7 @@ func secretsImport(inputFile string) error {
 		return nil
 	}
 
-	if err := backup.RestoreFromBlob(blob); err != nil {
+	if err := backup.RestoreFromBlobToVault(blob, vaultDir); err != nil {
 		return fmt.Errorf("failed to restore from backup: %w", err)
 	}
 
@@ -1072,34 +1142,23 @@ func secretsBackup() error {
 		return err
 	}
 
-	password, err := crypto.ReadUserPass()
+	masterKey, vaultDir, err := authenticateVault()
 	if err != nil {
-		return fmt.Errorf("failed to read password: %w", err)
+		return err
 	}
-	defer crypto.CleanupBytes(password)
-	encryptedMasterKey, salt, err := keyring.LoadEncryptedMasterKey()
-	if err != nil {
-		return fmt.Errorf("failed to load encrypted master key: %w", err)
-	}
-
-	derivedKey, _, err := crypto.DeriveKeyFromUserPass([]byte(password), salt)
-	if err != nil {
-		return fmt.Errorf("failed to derive key: %w", err)
-	}
-	defer crypto.CleanupBytes(derivedKey)
-
-	_, err = crypto.DecryptMasterKey(encryptedMasterKey, derivedKey)
-	if err != nil {
-		storage.RecordFailedAttempt()
-		return fmt.Errorf("failed to decrypt master key - incorrect password")
-	}
-
-	storage.ResetRateLimit()
+	defer crypto.CleanupBytes(masterKey)
 
 	ui.PrintInfo(">", "creating encrypted backup...")
 	fmt.Println()
 
-	if err := backup.CreateAutoBackup(password); err != nil {
+	ui.PrintMuted("  enter a password to encrypt the backup:")
+	backupPassword, err := crypto.ReadUserPass()
+	if err != nil {
+		return fmt.Errorf("failed to read backup password: %w", err)
+	}
+	defer crypto.CleanupBytes(backupPassword)
+
+	if err := backup.CreateAutoBackupForVault(vaultDir, backupPassword); err != nil {
 		return fmt.Errorf("failed to create backup: %w", err)
 	}
 
@@ -1411,35 +1470,16 @@ func secretsHistory() error {
 		return err
 	}
 
-	password, err := crypto.ReadUserPass()
+	masterKey, vaultDir, err := authenticateVault()
 	if err != nil {
-		return fmt.Errorf("failed to read password: %w", err)
-	}
-	defer crypto.CleanupBytes(password)
-	encryptedMasterKey, salt, err := keyring.LoadEncryptedMasterKey()
-	if err != nil {
-		return fmt.Errorf("failed to load encrypted master key: %w", err)
-	}
-
-	derivedKey, _, err := crypto.DeriveKeyFromUserPass([]byte(password), salt)
-	if err != nil {
-		return fmt.Errorf("failed to derive key: %w", err)
-	}
-	defer crypto.CleanupBytes(derivedKey)
-
-	masterKey, err := crypto.DecryptMasterKey(encryptedMasterKey, derivedKey)
-	if err != nil {
-		storage.RecordFailedAttempt()
-		return fmt.Errorf("failed to decrypt master key - incorrect password")
+		return err
 	}
 	defer crypto.CleanupBytes(masterKey)
-
-	storage.ResetRateLimit()
 
 	ui.PrintInfo(">", "loading audit history...")
 	fmt.Println()
 
-	events, err := audit.GetAuditHistory(masterKey, 50, "", "")
+	events, err := audit.GetAuditHistoryForVault(vaultDir, masterKey, 50, "", "")
 	if err != nil {
 		return fmt.Errorf("failed to get audit history: %w", err)
 	}
@@ -1468,8 +1508,18 @@ func secretsHistory() error {
 			ui.PrintError("x", eventLine)
 		}
 
-		if event.IP != "" {
-			ui.PrintMuted(fmt.Sprintf("    IP: %s", event.IP))
+		if event.IP != "" || event.PublicIP != "" {
+			ipInfo := ""
+			if event.IP != "" {
+				ipInfo = fmt.Sprintf("Local: %s", event.IP)
+			}
+			if event.PublicIP != "" {
+				if ipInfo != "" {
+					ipInfo += ", "
+				}
+				ipInfo += fmt.Sprintf("Public: %s", event.PublicIP)
+			}
+			ui.PrintMuted(fmt.Sprintf("    IP: %s", ipInfo))
 		}
 		if event.Error != "" {
 			ui.PrintMuted(fmt.Sprintf("    Error: %s", event.Error))
@@ -1479,6 +1529,223 @@ func secretsHistory() error {
 	fmt.Println()
 	ui.PrintTip("tip: audit logs are encrypted and stored securely")
 	ui.PrintTip("     last 10,000 events are retained")
+	fmt.Println()
+	return nil
+}
+
+func handleVaultCommand(args []string) error {
+	if len(args) == 0 {
+		ui.PrintError("x", "usage: secrets vault <create|list|switch|delete|info>")
+		return nil
+	}
+
+	subcommand := args[0]
+	switch subcommand {
+	case "create":
+		return vaultCreate()
+	case "list":
+		return vaultList()
+	case "switch":
+		if len(args) < 2 {
+			ui.PrintError("x", "usage: secrets vault switch <name>")
+			return nil
+		}
+		return vaultSwitch(args[1])
+	case "delete":
+		if len(args) < 2 {
+			ui.PrintError("x", "usage: secrets vault delete <name>")
+			return nil
+		}
+		return vaultDelete(args[1])
+	case "info":
+		return vaultInfo()
+	default:
+		ui.PrintError("x", fmt.Sprintf("unknown vault command: %s", subcommand))
+		return nil
+	}
+}
+
+func vaultCreate() error {
+	ui.PrintTitle("creating new vault")
+	fmt.Println()
+
+	ui.PrintPrompt("enter vault name: ")
+	var vaultName string
+	fmt.Scanln(&vaultName)
+
+	if vaultName == "" {
+		return fmt.Errorf("vault name cannot be empty")
+	}
+
+	exists, err := vaultmanager.VaultExists(vaultName)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return fmt.Errorf("vault '%s' already exists", vaultName)
+	}
+
+	ui.PrintPrompt("enter description (optional): ")
+	scanner := bufio.NewScanner(os.Stdin)
+	var description string
+	if scanner.Scan() {
+		description = scanner.Text()
+	}
+
+	ui.PrintPrompt("vault type (solo/group): ")
+	var vaultTypeStr string
+	fmt.Scanln(&vaultTypeStr)
+
+	var vaultType vaultmanager.VaultType
+	if vaultTypeStr == "group" {
+		vaultType = vaultmanager.VaultTypeGroup
+	} else {
+		vaultType = vaultmanager.VaultTypeSolo
+	}
+
+	if err := vaultmanager.CreateVault(vaultName, vaultType, description); err != nil {
+		return fmt.Errorf("failed to create vault: %w", err)
+	}
+
+	fmt.Println()
+	ui.PrintSuccess("+", fmt.Sprintf("vault '%s' created successfully!", vaultName))
+	ui.PrintMuted(fmt.Sprintf("  type: %s", vaultType))
+	if description != "" {
+		ui.PrintMuted(fmt.Sprintf("  description: %s", description))
+	}
+	fmt.Println()
+	ui.PrintTip(fmt.Sprintf("tip: use 'secrets vault switch %s' to activate this vault", vaultName))
+	ui.PrintTip("     then use 'secrets init' to initialize it")
+	fmt.Println()
+	return nil
+}
+
+func vaultList() error {
+	ui.PrintTitle("vaults")
+	fmt.Println()
+
+	vaults, err := vaultmanager.ListVaults()
+	if err != nil {
+		return fmt.Errorf("failed to list vaults: %w", err)
+	}
+
+	if len(vaults) == 0 {
+		ui.PrintMuted("no vaults created yet")
+		fmt.Println()
+		ui.PrintTip("tip: use 'secrets vault create' to create a vault")
+		fmt.Println()
+		return nil
+	}
+
+	activeVault, err := vaultmanager.GetActiveVault()
+	if err != nil {
+		return err
+	}
+
+	ui.PrintInfo("*", fmt.Sprintf("found %d vault(s):", len(vaults)))
+	fmt.Println()
+
+	for _, vault := range vaults {
+		indicator := " "
+		if vault.Name == activeVault {
+			indicator = "*"
+			ui.PrintSuccess(fmt.Sprintf("  %s", indicator), fmt.Sprintf("%s (%s) - %s [ACTIVE]",
+				vault.Name, vault.Type, vault.Description))
+		} else {
+			ui.PrintListItem(fmt.Sprintf("  %s", indicator), fmt.Sprintf("%s (%s) - %s",
+				vault.Name, vault.Type, vault.Description))
+		}
+	}
+	fmt.Println()
+	return nil
+}
+
+func vaultSwitch(vaultName string) error {
+	ui.PrintTitle("switching vault")
+	fmt.Println()
+
+	exists, err := vaultmanager.VaultExists(vaultName)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("vault '%s' does not exist", vaultName)
+	}
+
+	if err := vaultmanager.SetActiveVault(vaultName); err != nil {
+		return fmt.Errorf("failed to switch vault: %w", err)
+	}
+
+	fmt.Println()
+	ui.PrintSuccess("+", fmt.Sprintf("switched to vault '%s'", vaultName))
+	fmt.Println()
+	return nil
+}
+
+func vaultDelete(vaultName string) error {
+	ui.PrintTitle("deleting vault")
+	fmt.Println()
+
+	exists, err := vaultmanager.VaultExists(vaultName)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("vault '%s' does not exist", vaultName)
+	}
+
+	ui.PrintWarning("!", fmt.Sprintf("this will permanently delete vault '%s' and all its secrets!", vaultName))
+	ui.PrintPrompt("type the vault name to confirm: ")
+	var confirm string
+	fmt.Scanln(&confirm)
+
+	if confirm != vaultName {
+		ui.PrintMuted("deletion cancelled")
+		fmt.Println()
+		return nil
+	}
+
+	if err := vaultmanager.DeleteVault(vaultName); err != nil {
+		return fmt.Errorf("failed to delete vault: %w", err)
+	}
+
+	fmt.Println()
+	ui.PrintSuccess("+", fmt.Sprintf("vault '%s' deleted successfully", vaultName))
+	fmt.Println()
+	return nil
+}
+
+func vaultInfo() error {
+	ui.PrintTitle("vault information")
+	fmt.Println()
+
+	activeVault, err := vaultmanager.GetActiveVault()
+	if err != nil {
+		return err
+	}
+
+	info, err := vaultmanager.GetVaultInfo(activeVault)
+	if err != nil {
+		return err
+	}
+
+	ui.PrintSuccess("+", fmt.Sprintf("active vault: %s", info.Name))
+	ui.PrintMuted(fmt.Sprintf("  type: %s", info.Type))
+	ui.PrintMuted(fmt.Sprintf("  description: %s", info.Description))
+	ui.PrintMuted(fmt.Sprintf("  created: %s", info.CreatedAt.Format("2006-01-02 15:04:05")))
+	
+	vaultDir := vaultmanager.GetVaultDir(activeVault)
+	ui.PrintMuted(fmt.Sprintf("  location: %s", vaultDir))
+	
+	initialized := keyring.VaultKeyringExists(vaultDir)
+	if initialized {
+		ui.PrintMuted("  status: initialized")
+	} else {
+		ui.PrintMuted("  status: not initialized")
+		fmt.Println()
+		ui.PrintTip("tip: use 'secrets init' to initialize this vault")
+	}
+	
 	fmt.Println()
 	return nil
 }

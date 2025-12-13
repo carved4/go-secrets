@@ -143,6 +143,32 @@ func DeriveKeyFromUserPass(password []byte, salt []byte) (derivedKey []byte, use
 	return derivedKey, salt, nil
 }
 
+func DeriveVaultKey(password []byte, vaultName string, salt []byte) (derivedKey []byte, usedSalt []byte, err error) {
+	// Only generate salt if none provided
+	if len(salt) == 0 {
+		salt = make([]byte, 16)
+		if _, err := io.ReadFull(rand.Reader, salt); err != nil {
+			log.Println("could not generate salt")
+			return nil, nil, err
+		}
+	}
+	
+	// Mix vault context into password for vault-specific key derivation
+	// This ensures each vault has a cryptographically independent master key
+	// even when using the same passphrase
+	h := sha256.New()
+	h.Write(password)
+	h.Write([]byte("::vault-context::"))
+	h.Write([]byte(vaultName))
+	contextualPassword := h.Sum(nil)
+	defer ZeroMemory(contextualPassword)
+	
+	iterations := 600000
+	keyLength := 32
+	derivedKey = pbkdf2.Key(contextualPassword, salt, iterations, keyLength, sha256.New)
+	return derivedKey, salt, nil
+}
+
 func EncryptMasterKey(masterKey []byte, derivedKey []byte) ([]byte, error) {
 	c, err := aes.NewCipher(derivedKey)
 	if err != nil {

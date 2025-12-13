@@ -125,6 +125,10 @@ func GetBackupDir() string {
 	return filepath.Join(vaultDir, "backups")
 }
 
+func GetBackupDirForVault(vaultDir string) string {
+	return filepath.Join(vaultDir, "backups")
+}
+
 func CreateAutoBackup(password []byte) error {
 	backupDir := GetBackupDir()
 	if err := os.MkdirAll(backupDir, 0700); err != nil {
@@ -145,6 +149,92 @@ func CreateAutoBackup(password []byte) error {
 
 	if err := cleanOldBackups(backupDir, 10); err != nil {
 		return fmt.Errorf("failed to clean old backups: %w", err)
+	}
+
+	return nil
+}
+
+func CreateAutoBackupForVault(vaultDir string, password []byte) error {
+	backupDir := GetBackupDirForVault(vaultDir)
+	if err := os.MkdirAll(backupDir, 0700); err != nil {
+		return fmt.Errorf("failed to create backup directory: %w", err)
+	}
+
+	encryptedBlob, err := ExportSecretsFromVault(vaultDir, password)
+	if err != nil {
+		return fmt.Errorf("failed to export secrets: %w", err)
+	}
+
+	timestamp := time.Now().Format("20060102_150405")
+	backupPath := filepath.Join(backupDir, fmt.Sprintf("vault_backup_%s.enc", timestamp))
+
+	if err := os.WriteFile(backupPath, encryptedBlob, 0600); err != nil {
+		return fmt.Errorf("failed to write backup file: %w", err)
+	}
+
+	if err := cleanOldBackups(backupDir, 10); err != nil {
+		return fmt.Errorf("failed to clean old backups: %w", err)
+	}
+
+	return nil
+}
+
+func ExportSecretsFromVault(vaultDir string, password []byte) ([]byte, error) {
+	vault, err := storage.LoadVaultFromDir(vaultDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load vault: %w", err)
+	}
+
+	derivedKey, salt, err := crypto.DeriveKeyFromUserPass([]byte(password), nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive key: %w", err)
+	}
+	defer crypto.CleanupBytes(derivedKey)
+
+	blob := &ExportBlob{
+		Version:         "1.0",
+		ExportedAt:      time.Now(),
+		VaultID:         vault.VaultID,
+		SecretsMetadata: vault.SecretsMetadata,
+		Encrypted:       true,
+		Salt:            hex.EncodeToString(salt),
+	}
+
+	blobJSON, err := json.Marshal(blob)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal export blob: %w", err)
+	}
+
+	encryptedBlob, err := crypto.EncryptSecret(blobJSON, derivedKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encrypt export blob: %w", err)
+	}
+
+	wrapper := map[string]string{
+		"salt": hex.EncodeToString(salt),
+		"data": hex.EncodeToString(encryptedBlob),
+	}
+
+	wrapperJSON, err := json.MarshalIndent(wrapper, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal wrapper: %w", err)
+	}
+
+	return wrapperJSON, nil
+}
+
+func RestoreFromBlobToVault(blob *ExportBlob, vaultDir string) error {
+	vault, err := storage.LoadVaultFromDir(vaultDir)
+	if err != nil {
+		return fmt.Errorf("failed to load current vault: %w", err)
+	}
+
+	for name, metadata := range blob.SecretsMetadata {
+		vault.SecretsMetadata[name] = metadata
+	}
+
+	if err := storage.SaveVaultToDir(vaultDir, vault); err != nil {
+		return fmt.Errorf("failed to save restored vault: %w", err)
 	}
 
 	return nil

@@ -5,11 +5,10 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/carved4/go-secrets/internal/audit"
-	"github.com/carved4/go-secrets/internal/backup"
 	"github.com/carved4/go-secrets/internal/crypto"
-	"github.com/carved4/go-secrets/internal/keyring"
 	"github.com/carved4/go-secrets/internal/storage"
 	"github.com/carved4/go-secrets/internal/ui"
 )
@@ -22,47 +21,32 @@ func secretsRotate(args []string) error {
 		return err
 	}
 
-	password, err := crypto.ReadUserPass()
+	masterKey, vaultDir, err := authenticateVault()
 	if err != nil {
-		return fmt.Errorf("failed to read password: %w", err)
-	}
-	defer crypto.CleanupBytes(password)
-
-	encryptedMasterKey, salt, err := keyring.LoadEncryptedMasterKey()
-	if err != nil {
-		return fmt.Errorf("failed to load encrypted master key: %w", err)
-	}
-
-	derivedKey, _, err := crypto.DeriveKeyFromUserPass([]byte(password), salt)
-	if err != nil {
-		return fmt.Errorf("failed to derive key: %w", err)
-	}
-	defer crypto.CleanupBytes(derivedKey)
-
-	masterKey, err := crypto.DecryptMasterKey(encryptedMasterKey, derivedKey)
-	if err != nil {
-		storage.RecordFailedAttempt()
-		return fmt.Errorf("failed to decrypt master key - incorrect password")
+		return err
 	}
 	defer crypto.CleanupBytes(masterKey)
 
-	storage.ResetRateLimit()
-
 	if len(args) > 0 {
 		secretName := args[0]
-		return rotateSpecificSecret(secretName, masterKey, password)
+		return rotateSpecificSecret(secretName, masterKey, vaultDir)
 	}
 
-	return rotateAllSecrets(masterKey, password)
+	return rotateAllSecrets(masterKey, vaultDir)
 }
 
-func rotateSpecificSecret(secretName string, masterKey []byte, password []byte) error {
+func rotateSpecificSecret(secretName string, masterKey []byte, vaultDir string) error {
 	ui.PrintWarning("!", fmt.Sprintf("rotating secret: %s", secretName))
 	fmt.Println()
 
-	_, err := storage.GetSecretWithMode(secretName, useGroupVault)
+	vault, err := storage.LoadVaultFromDir(vaultDir)
 	if err != nil {
-		return fmt.Errorf("secret not found: %w", err)
+		return fmt.Errorf("failed to load vault: %w", err)
+	}
+
+	existing, exists := vault.SecretsMetadata[secretName]
+	if !exists {
+		return fmt.Errorf("secret not found: %s", secretName)
 	}
 
 	ui.PrintPrompt("paste the new secret value (press Enter when done): ")
@@ -85,16 +69,18 @@ func rotateSpecificSecret(secretName string, masterKey []byte, password []byte) 
 		return fmt.Errorf("failed to encrypt secret: %w", err)
 	}
 
-	if err := storage.AddSecretWithMode(secretName, encryptedSecret, useGroupVault); err != nil {
-		audit.LogEvent(currentUsername, "rotate", secretName, false, err.Error(), masterKey)
+	vault.SecretsMetadata[secretName] = storage.SecretMetadata{
+		EncryptedValue: fmt.Sprintf("%x", encryptedSecret),
+		CreatedAt:      existing.CreatedAt,
+		UpdatedAt:      time.Now(),
+	}
+
+	if err := storage.SaveVaultToDir(vaultDir, vault); err != nil {
+		audit.LogEventForVault(vaultDir, currentUsername, "rotate", secretName, false, err.Error(), masterKey)
 		return fmt.Errorf("failed to update secret: %w", err)
 	}
 
-	if err := backup.CreateAutoBackup(password); err != nil {
-		ui.PrintWarning("!", fmt.Sprintf("warning: auto-backup failed: %v", err))
-	}
-
-	audit.LogEvent(currentUsername, "rotate", secretName, true, "", masterKey)
+	audit.LogEventForVault(vaultDir, currentUsername, "rotate", secretName, true, "", masterKey)
 
 	fmt.Println()
 	ui.PrintSuccess("+", fmt.Sprintf("secret '%s' rotated successfully!", secretName))
@@ -102,10 +88,15 @@ func rotateSpecificSecret(secretName string, masterKey []byte, password []byte) 
 	return nil
 }
 
-func rotateAllSecrets(masterKey []byte, password []byte) error {
-	names, err := storage.ListSecretsWithMode(useGroupVault)
+func rotateAllSecrets(masterKey []byte, vaultDir string) error {
+	vault, err := storage.LoadVaultFromDir(vaultDir)
 	if err != nil {
-		return fmt.Errorf("failed to list secrets: %w", err)
+		return fmt.Errorf("failed to load vault: %w", err)
+	}
+
+	var names []string
+	for name := range vault.SecretsMetadata {
+		names = append(names, name)
 	}
 
 	if len(names) == 0 {
@@ -123,13 +114,13 @@ func rotateAllSecrets(masterKey []byte, password []byte) error {
 	fmt.Scanln(&useFile)
 
 	if useFile == "yes" || useFile == "y" {
-		return rotateFromEnvFile(names, masterKey, password)
+		return rotateFromEnvFile(names, masterKey, vaultDir)
 	}
 
-	return rotateInteractively(names, masterKey, password)
+	return rotateInteractively(names, masterKey, vaultDir)
 }
 
-func rotateFromEnvFile(existingNames []string, masterKey []byte, password []byte) error {
+func rotateFromEnvFile(existingNames []string, masterKey []byte, vaultDir string) error {
 	ui.PrintPrompt("enter path to .env file: ")
 	var filePath string
 	fmt.Scanln(&filePath)
@@ -152,11 +143,16 @@ func rotateFromEnvFile(existingNames []string, masterKey []byte, password []byte
 	ui.PrintInfo(">", fmt.Sprintf("found %d variable(s) in .env file", len(envVars)))
 	fmt.Println()
 
-	if err := storage.ClearAllSecrets(useGroupVault); err != nil {
-		return fmt.Errorf("failed to clear secrets: %w", err)
+	vault, err := storage.LoadVaultFromDir(vaultDir)
+	if err != nil {
+		return fmt.Errorf("failed to load vault: %w", err)
 	}
 
+	// Clear existing secrets
+	vault.SecretsMetadata = make(map[string]storage.SecretMetadata)
+
 	rotatedCount := 0
+	now := time.Now()
 	for name, value := range envVars {
 		secretBytes := []byte(value)
 		crypto.SecureBytes(secretBytes)
@@ -169,18 +165,19 @@ func rotateFromEnvFile(existingNames []string, masterKey []byte, password []byte
 			continue
 		}
 
-		if err := storage.AddSecretWithMode(name, encryptedSecret, useGroupVault); err != nil {
-			ui.PrintError("x", fmt.Sprintf("failed to store %s: %v", name, err))
-			continue
+		vault.SecretsMetadata[name] = storage.SecretMetadata{
+			EncryptedValue: fmt.Sprintf("%x", encryptedSecret),
+			CreatedAt:      now,
+			UpdatedAt:      now,
 		}
 
-		audit.LogEvent(currentUsername, "rotate", name, true, "", masterKey)
+		audit.LogEventForVault(vaultDir, currentUsername, "rotate", name, true, "", masterKey)
 		ui.PrintSuccess("+", fmt.Sprintf("rotated: %s", name))
 		rotatedCount++
 	}
 
-	if err := backup.CreateAutoBackup(password); err != nil {
-		ui.PrintWarning("!", fmt.Sprintf("warning: auto-backup failed: %v", err))
+	if err := storage.SaveVaultToDir(vaultDir, vault); err != nil {
+		return fmt.Errorf("failed to save vault: %w", err)
 	}
 
 	fmt.Println()
@@ -207,16 +204,22 @@ func rotateFromEnvFile(existingNames []string, masterKey []byte, password []byte
 	return nil
 }
 
-func rotateInteractively(names []string, masterKey []byte, password []byte) error {
+func rotateInteractively(names []string, masterKey []byte, vaultDir string) error {
 	ui.PrintInfo(">", "enter new values for each secret")
 	ui.PrintMuted("  press Enter to skip a secret (it will be deleted)")
 	fmt.Println()
-	if err := storage.ClearAllSecrets(useGroupVault); err != nil {
-		return fmt.Errorf("failed to clear secrets: %w", err)
+
+	vault, err := storage.LoadVaultFromDir(vaultDir)
+	if err != nil {
+		return fmt.Errorf("failed to load vault: %w", err)
 	}
+
+	// Clear existing secrets
+	vault.SecretsMetadata = make(map[string]storage.SecretMetadata)
 
 	scanner := bufio.NewScanner(os.Stdin)
 	rotatedCount := 0
+	now := time.Now()
 
 	for _, name := range names {
 		ui.PrintPrompt(fmt.Sprintf("%s: ", name))
@@ -227,7 +230,7 @@ func rotateInteractively(names []string, masterKey []byte, password []byte) erro
 		newValue := strings.TrimSpace(scanner.Text())
 		if newValue == "" {
 			ui.PrintMuted(fmt.Sprintf("  skipped %s (will be deleted)", name))
-			audit.LogEvent(currentUsername, "rotate-skip", name, true, "skipped during rotation", masterKey)
+			audit.LogEventForVault(vaultDir, currentUsername, "rotate-skip", name, true, "skipped during rotation", masterKey)
 			continue
 		}
 
@@ -242,17 +245,18 @@ func rotateInteractively(names []string, masterKey []byte, password []byte) erro
 			continue
 		}
 
-		if err := storage.AddSecretWithMode(name, encryptedSecret, useGroupVault); err != nil {
-			ui.PrintError("x", fmt.Sprintf("failed to store %s: %v", name, err))
-			continue
+		vault.SecretsMetadata[name] = storage.SecretMetadata{
+			EncryptedValue: fmt.Sprintf("%x", encryptedSecret),
+			CreatedAt:      now,
+			UpdatedAt:      now,
 		}
 
-		audit.LogEvent(currentUsername, "rotate", name, true, "", masterKey)
+		audit.LogEventForVault(vaultDir, currentUsername, "rotate", name, true, "", masterKey)
 		rotatedCount++
 	}
 
-	if err := backup.CreateAutoBackup(password); err != nil {
-		ui.PrintWarning("!", fmt.Sprintf("warning: auto-backup failed: %v", err))
+	if err := storage.SaveVaultToDir(vaultDir, vault); err != nil {
+		return fmt.Errorf("failed to save vault: %w", err)
 	}
 
 	fmt.Println()

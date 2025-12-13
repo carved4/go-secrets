@@ -4,10 +4,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/carved4/go-secrets/internal/crypto"
@@ -20,6 +23,7 @@ type AuditEvent struct {
 	Action    string    `json:"action"`
 	Secret    string    `json:"secret,omitempty"`
 	IP        string    `json:"ip,omitempty"`
+	PublicIP  string    `json:"public_ip,omitempty"`
 	Success   bool      `json:"success"`
 	Error     string    `json:"error,omitempty"`
 }
@@ -32,6 +36,119 @@ type AuditLog struct {
 func GetAuditLogPath() string {
 	vaultDir := storage.GetVaultDir()
 	return filepath.Join(vaultDir, "audit.json")
+}
+
+func GetAuditLogPathForVault(vaultDir string) string {
+	return filepath.Join(vaultDir, "audit.json")
+}
+
+func LogEventForVault(vaultDir string, user string, action string, secret string, success bool, errorMsg string, masterKey []byte) error {
+	auditLogPath := GetAuditLogPathForVault(vaultDir)
+	
+	event := AuditEvent{
+		Timestamp: time.Now().UTC(),
+		User:      user,
+		Action:    action,
+		Secret:    secret,
+		IP:        getLocalIP(),
+		PublicIP:  getPublicIP(),
+		Success:   success,
+		Error:     errorMsg,
+	}
+
+	eventJSON, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("failed to marshal audit event: %w", err)
+	}
+
+	encryptedEvent, err := crypto.EncryptSecret(eventJSON, masterKey)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt audit event: %w", err)
+	}
+
+	auditLog, err := loadAuditLog(auditLogPath)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to load audit log: %w", err)
+	}
+
+	if auditLog == nil {
+		auditLog = &AuditLog{
+			Events: []string{},
+		}
+	}
+
+	auditLog.Events = append(auditLog.Events, hex.EncodeToString(encryptedEvent))
+
+	if len(auditLog.Events) > 10000 {
+		auditLog.Events = auditLog.Events[len(auditLog.Events)-10000:]
+	}
+
+	auditLog.Checksum = computeAuditLogChecksum(auditLog.Events, masterKey)
+
+	if err := saveAuditLog(auditLogPath, auditLog); err != nil {
+		return fmt.Errorf("failed to save audit log: %w", err)
+	}
+
+	return nil
+}
+
+func GetAuditHistoryForVault(vaultDir string, masterKey []byte, limit int, filterUser string, filterAction string) ([]AuditEvent, error) {
+	auditLogPath := GetAuditLogPathForVault(vaultDir)
+	
+	auditLog, err := loadAuditLog(auditLogPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []AuditEvent{}, nil
+		}
+		return nil, fmt.Errorf("failed to load audit log: %w", err)
+	}
+
+	if auditLog.Checksum != "" {
+		expectedChecksum := computeAuditLogChecksum(auditLog.Events, masterKey)
+		if auditLog.Checksum != expectedChecksum {
+			return nil, fmt.Errorf("audit log integrity check failed - possible tampering detected")
+		}
+	}
+
+	var events []AuditEvent
+	for _, encryptedEventHex := range auditLog.Events {
+		encryptedEvent, err := hex.DecodeString(encryptedEventHex)
+		if err != nil {
+			continue
+		}
+
+		decryptedEvent, err := crypto.DecryptSecret(encryptedEvent, masterKey)
+		if err != nil {
+			continue
+		}
+
+		var event AuditEvent
+		if err := json.Unmarshal(decryptedEvent, &event); err != nil {
+			crypto.CleanupBytes(decryptedEvent)
+			continue
+		}
+		crypto.CleanupBytes(decryptedEvent)
+
+		if filterUser != "" && event.User != filterUser {
+			continue
+		}
+
+		if filterAction != "" && event.Action != filterAction {
+			continue
+		}
+
+		events = append(events, event)
+	}
+
+	sort.Slice(events, func(i, j int) bool {
+		return events[i].Timestamp.After(events[j].Timestamp)
+	})
+
+	if limit > 0 && len(events) > limit {
+		events = events[:limit]
+	}
+
+	return events, nil
 }
 
 func getLocalIP() string {
@@ -50,6 +167,37 @@ func getLocalIP() string {
 	return "127.0.0.1"
 }
 
+func getPublicIP() string {
+	// Try multiple services in case one is down
+	services := []string{
+		"https://api.ipify.org",
+		"https://ifconfig.me/ip",
+		"https://icanhazip.com",
+	}
+
+	client := &http.Client{Timeout: 3 * time.Second}
+
+	for _, service := range services {
+		resp, err := client.Get(service)
+		if err != nil {
+			continue
+		}
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			continue
+		}
+
+		ip := strings.TrimSpace(string(body))
+		if net.ParseIP(ip) != nil {
+			return ip
+		}
+	}
+
+	return "unknown"
+}
+
 func LogEvent(user string, action string, secret string, success bool, errorMsg string, masterKey []byte) error {
 	event := AuditEvent{
 		Timestamp: time.Now().UTC(),
@@ -57,6 +205,7 @@ func LogEvent(user string, action string, secret string, success bool, errorMsg 
 		Action:    action,
 		Secret:    secret,
 		IP:        getLocalIP(),
+		PublicIP:  getPublicIP(),
 		Success:   success,
 		Error:     errorMsg,
 	}

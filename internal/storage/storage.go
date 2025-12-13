@@ -75,6 +75,40 @@ func GetVaultPathForMode(useGroup bool) string {
 	return GetVaultPath()
 }
 
+func GetVaultPathForVault(vaultDir string) string {
+	return filepath.Join(vaultDir, "vault.json")
+}
+
+func LoadVaultFromDir(vaultDir string) (*Vault, error) {
+	vaultPath := GetVaultPathForVault(vaultDir)
+	return LoadVault(vaultPath)
+}
+
+func SaveVaultToDir(vaultDir string, vault *Vault) error {
+	vaultPath := GetVaultPathForVault(vaultDir)
+	return SaveVault(vaultPath, vault)
+}
+
+func InitVaultInDir(vaultDir string) error {
+	if err := os.MkdirAll(vaultDir, 0700); err != nil {
+		log.Println("could not create vault directory", err)
+		return err
+	}
+
+	vaultID := generateVaultID()
+	vault := &Vault{
+		SecretsMetadata: make(map[string]SecretMetadata),
+		VaultID:         vaultID,
+	}
+
+	vaultPath := GetVaultPathForVault(vaultDir)
+	if err := SaveVault(vaultPath, vault); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func isWindows() bool {
 	return os.PathSeparator == '\\' && os.PathListSeparator == ';'
 }
