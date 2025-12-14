@@ -303,3 +303,9 @@ func CleanupBytes(data []byte) {
 func NewHMAC(key []byte) hash.Hash {
 	return hmac.New(sha256.New, key)
 }
+
+func DecodeHexString(hexStr string) ([]byte, error) {
+	decoded := make([]byte, len(hexStr)/2)
+	_, err := fmt.Sscanf(hexStr, "%x", &decoded)
+	return decoded, err
+}

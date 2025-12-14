@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"github.com/carved4/go-secrets/internal/crypto"
 	"github.com/carved4/go-secrets/internal/storage"
@@ -26,18 +27,28 @@ type Group struct {
 	SecretPrefix []string `json:"secret_prefix"`
 }
 
+type MasterKeyRotation struct {
+	RotatedAt time.Time `json:"rotated_at"`
+	RotatedBy string    `json:"rotated_by"`
+}
+
 type MultiUserVault struct {
-	Version        string                  `json:"version"`
-	Mode           string                  `json:"mode"`
-	Secrets        map[string]string       `json:"secrets"`
-	MasterKeyShare map[string]UserKeyShare `json:"master_key_shares,omitempty"`
-	Groups         map[string]Group        `json:"groups,omitempty"`
-	HMAC           string                  `json:"hmac"`
-	VaultID        string                  `json:"vault_id"`
+	Version           string                  `json:"version"`
+	Mode              string                  `json:"mode"`
+	Secrets           map[string]string       `json:"secrets"`
+	MasterKeyShare    map[string]UserKeyShare `json:"master_key_shares,omitempty"`
+	Groups            map[string]Group        `json:"groups,omitempty"`
+	HMAC              string                  `json:"hmac"`
+	VaultID           string                  `json:"vault_id"`
+	MasterKeyRotation *MasterKeyRotation      `json:"master_key_rotation,omitempty"`
 }
 
 func GetMultiUserVaultPath() string {
 	return storage.GetGroupVaultPath()
+}
+
+func GetMultiUserVaultPathForVault(vaultDir string) string {
+	return filepath.Join(vaultDir, "multiuser.json")
 }
 
 func LoadMultiUserVault(path string) (*MultiUserVault, error) {
@@ -144,7 +155,16 @@ func computeMultiUserVaultHMAC(vault *MultiUserVault) string {
 }
 
 func InitMultiUserVault(username string, password []byte, masterKey []byte) error {
-	vaultPath := GetMultiUserVaultPath()
+	return InitMultiUserVaultInDir("", username, password, masterKey)
+}
+
+func InitMultiUserVaultInDir(vaultDir string, username string, password []byte, masterKey []byte) error {
+	var vaultPath string
+	if vaultDir == "" {
+		vaultPath = GetMultiUserVaultPath()
+	} else {
+		vaultPath = GetMultiUserVaultPathForVault(vaultDir)
+	}
 
 	derivedKey, salt, err := crypto.DeriveKeyFromUserPass([]byte(password), nil)
 	if err != nil {
@@ -180,7 +200,16 @@ func InitMultiUserVault(username string, password []byte, masterKey []byte) erro
 }
 
 func AddUserToVault(username string, password []byte, masterKey []byte) error {
-	vaultPath := GetMultiUserVaultPath()
+	return AddUserToVaultInDir("", username, password, masterKey)
+}
+
+func AddUserToVaultInDir(vaultDir string, username string, password []byte, masterKey []byte) error {
+	var vaultPath string
+	if vaultDir == "" {
+		vaultPath = GetMultiUserVaultPath()
+	} else {
+		vaultPath = GetMultiUserVaultPathForVault(vaultDir)
+	}
 	vault, err := LoadMultiUserVault(vaultPath)
 	if err != nil {
 		return fmt.Errorf("failed to load vault: %w", err)
@@ -219,7 +248,16 @@ func AddUserToVault(username string, password []byte, masterKey []byte) error {
 }
 
 func GetMasterKeyForUser(username string, password []byte) ([]byte, error) {
-	vaultPath := GetMultiUserVaultPath()
+	return GetMasterKeyForUserInDir("", username, password)
+}
+
+func GetMasterKeyForUserInDir(vaultDir string, username string, password []byte) ([]byte, error) {
+	var vaultPath string
+	if vaultDir == "" {
+		vaultPath = GetMultiUserVaultPath()
+	} else {
+		vaultPath = GetMultiUserVaultPathForVault(vaultDir)
+	}
 	vault, err := LoadMultiUserVault(vaultPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load vault: %w", err)
@@ -259,7 +297,16 @@ func GetMasterKeyForUser(username string, password []byte) ([]byte, error) {
 }
 
 func CreateGroup(groupName string, users []string, secretPrefixes []string) error {
-	vaultPath := GetMultiUserVaultPath()
+	return CreateGroupInDir("", groupName, users, secretPrefixes)
+}
+
+func CreateGroupInDir(vaultDir string, groupName string, users []string, secretPrefixes []string) error {
+	var vaultPath string
+	if vaultDir == "" {
+		vaultPath = GetMultiUserVaultPath()
+	} else {
+		vaultPath = GetMultiUserVaultPathForVault(vaultDir)
+	}
 	vault, err := LoadMultiUserVault(vaultPath)
 	if err != nil {
 		return fmt.Errorf("failed to load vault: %w", err)
@@ -293,7 +340,16 @@ func CreateGroup(groupName string, users []string, secretPrefixes []string) erro
 }
 
 func UserCanAccessSecret(username string, secretName string) (bool, error) {
-	vaultPath := GetMultiUserVaultPath()
+	return UserCanAccessSecretInDir("", username, secretName)
+}
+
+func UserCanAccessSecretInDir(vaultDir string, username string, secretName string) (bool, error) {
+	var vaultPath string
+	if vaultDir == "" {
+		vaultPath = GetMultiUserVaultPath()
+	} else {
+		vaultPath = GetMultiUserVaultPathForVault(vaultDir)
+	}
 	vault, err := LoadMultiUserVault(vaultPath)
 	if err != nil {
 		return false, fmt.Errorf("failed to load vault: %w", err)
@@ -327,7 +383,16 @@ func UserCanAccessSecret(username string, secretName string) (bool, error) {
 }
 
 func ListAccessibleSecrets(username string) ([]string, error) {
-	vaultPath := GetMultiUserVaultPath()
+	return ListAccessibleSecretsInDir("", username)
+}
+
+func ListAccessibleSecretsInDir(vaultDir string, username string) ([]string, error) {
+	var vaultPath string
+	if vaultDir == "" {
+		vaultPath = GetMultiUserVaultPath()
+	} else {
+		vaultPath = GetMultiUserVaultPathForVault(vaultDir)
+	}
 	vault, err := LoadMultiUserVault(vaultPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load vault: %w", err)
@@ -376,7 +441,16 @@ func ListAccessibleSecrets(username string) ([]string, error) {
 }
 
 func IsMultiUserMode() (bool, error) {
-	vaultPath := GetMultiUserVaultPath()
+	return IsMultiUserModeInDir("")
+}
+
+func IsMultiUserModeInDir(vaultDir string) (bool, error) {
+	var vaultPath string
+	if vaultDir == "" {
+		vaultPath = GetMultiUserVaultPath()
+	} else {
+		vaultPath = GetMultiUserVaultPathForVault(vaultDir)
+	}
 	if _, err := os.Stat(vaultPath); os.IsNotExist(err) {
 		return false, nil
 	}

@@ -90,6 +90,17 @@ func authenticateVault() (masterKey []byte, vaultDir string, err error) {
 	}
 
 	storage.ResetRateLimit()
+	
+	// Check for master key rotation notification
+	vault, err := storage.LoadVaultFromDir(vaultDir)
+	if err == nil && vault.MasterKeyRotation != nil {
+		fmt.Println()
+		ui.PrintWarning("!", "MASTER KEY WAS ROTATED")
+		ui.PrintMuted(fmt.Sprintf("  rotated at: %s", vault.MasterKeyRotation.RotatedAt.Format("2006-01-02 15:04:05")))
+		ui.PrintMuted(fmt.Sprintf("  rotated by: %s", vault.MasterKeyRotation.RotatedBy))
+		fmt.Println()
+	}
+	
 	return masterKey, vaultDir, nil
 }
 
@@ -160,6 +171,27 @@ func runInteractiveMode() {
 		}
 
 		if input == "mode" || input == "toggle" {
+			// Check if active vault is initialized and prevent mode switching
+			activeVault, _ := vaultmanager.GetActiveVault()
+			vaultDir := vaultmanager.GetVaultDir(activeVault)
+			
+			// Check if vault is initialized as solo
+			if keyring.VaultKeyringExists(vaultDir) {
+				vaultInfo, err := vaultmanager.GetVaultInfo(activeVault)
+				if err == nil {
+					if vaultInfo.Type == vaultmanager.VaultTypeSolo && useGroupVault == false {
+						ui.PrintError("x", "vault is initialized as SOLO vault - cannot switch to group mode")
+						ui.PrintMuted("  create a new vault with type 'group' if you need multi-user support")
+						fmt.Println()
+						continue
+					} else if vaultInfo.Type == vaultmanager.VaultTypeGroup && useGroupVault == true {
+						ui.PrintError("x", "vault is initialized as GROUP vault - cannot switch to solo mode")
+						fmt.Println()
+						continue
+					}
+				}
+			}
+			
 			useGroupVault = !useGroupVault
 			if useGroupVault {
 				ui.PrintSuccess("+", "switched to GROUP vault mode")
@@ -297,6 +329,9 @@ func executeCommand(args []string) error {
 	case "history":
 		return secretsHistory()
 	case "rotate":
+		if len(args) > 1 && args[1] == "--master-key" {
+			return secretsRotateMasterKey()
+		}
 		return secretsRotate(args[1:])
 	case "vault":
 		if len(args) < 2 {
@@ -351,6 +386,7 @@ func printUsage() {
 	ui.PrintListItem("  >", "backup         create automatic backup")
 	ui.PrintListItem("  >", "history        view audit log history")
 	ui.PrintListItem("  >", "rotate [name]  rotate all secrets or a specific secret")
+	ui.PrintListItem("  >", "rotate --master-key  rotate the master encryption key")
 	ui.PrintListItem("  >", "restore <name> [--output <path>]  restore secret to file")
 	ui.PrintListItem("  >", "wipe <path>    securely delete a file")
 	fmt.Println()
@@ -378,6 +414,7 @@ func printUsage() {
 	ui.PrintMuted("  secrets import-passwords passwords.csv  # import Chrome passwords")
 	ui.PrintMuted("  secrets rotate                  # rotate all secrets")
 	ui.PrintMuted("  secrets rotate API_KEY          # rotate specific secret")
+	ui.PrintMuted("  secrets rotate --master-key     # rotate master encryption key")
 	ui.PrintMuted("  secrets restore DB_FILE --output ./database.db  # restore file secret")
 	ui.PrintMuted("  secrets wipe ./database.db      # securely delete file")
 	ui.PrintMuted("  secrets --group add             # add to group vault")
@@ -410,12 +447,34 @@ func secretsInit(useGroups bool) error {
 	if keyring.VaultKeyringExists(vaultDir) {
 		return fmt.Errorf("vault '%s' is already initialized", activeVault)
 	}
+	
+	// Check if multiuser vault exists for group vaults
+	if useGroups {
+		isMultiUser, _ := multiuser.IsMultiUserModeInDir(vaultDir)
+		if isMultiUser {
+			return fmt.Errorf("vault '%s' is already initialized as multi-user vault", activeVault)
+		}
+	}
 
 	// Ensure vault is registered in config (needed for GetVaultInfo during authentication)
 	exists, err := vaultmanager.VaultExists(activeVault)
 	if err != nil {
 		return fmt.Errorf("failed to check vault existence: %w", err)
 	}
+	
+	// Check vault type matches initialization mode
+	if exists {
+		vaultInfo, err := vaultmanager.GetVaultInfo(activeVault)
+		if err == nil {
+			if useGroups && vaultInfo.Type != vaultmanager.VaultTypeGroup {
+				return fmt.Errorf("vault '%s' is configured as %s vault, not group vault", activeVault, vaultInfo.Type)
+			}
+			if !useGroups && vaultInfo.Type != vaultmanager.VaultTypeSolo {
+				return fmt.Errorf("vault '%s' is configured as %s vault, not solo vault", activeVault, vaultInfo.Type)
+			}
+		}
+	}
+	
 	if !exists {
 		vaultType := vaultmanager.VaultTypeSolo
 		if useGroups {
@@ -472,7 +531,13 @@ func promptForUsername() error {
 		return nil
 	}
 
-	isMultiUser, err := multiuser.IsMultiUserMode()
+	// Get vault directory
+	_, vaultDir, err := getActiveVaultContext()
+	if err != nil {
+		return fmt.Errorf("failed to get vault context: %w", err)
+	}
+
+	isMultiUser, err := multiuser.IsMultiUserModeInDir(vaultDir)
 	if err != nil {
 		return fmt.Errorf("failed to check vault mode: %w", err)
 	}
@@ -489,9 +554,19 @@ func promptForUsername() error {
 	}
 	defer crypto.CleanupBytes(password)
 
-	_, err = multiuser.GetMasterKeyForUser(currentUsername, password)
+	_, err = multiuser.GetMasterKeyForUserInDir(vaultDir, currentUsername, password)
 	if err != nil {
 		return fmt.Errorf("authentication failed: %w", err)
+	}
+
+	// Check for master key rotation notification
+	multiUserVault, err := multiuser.LoadMultiUserVault(multiuser.GetMultiUserVaultPathForVault(vaultDir))
+	if err == nil && multiUserVault.MasterKeyRotation != nil {
+		fmt.Println()
+		ui.PrintWarning("!", "MASTER KEY WAS ROTATED")
+		ui.PrintMuted(fmt.Sprintf("  rotated at: %s", multiUserVault.MasterKeyRotation.RotatedAt.Format("2006-01-02 15:04:05")))
+		ui.PrintMuted(fmt.Sprintf("  rotated by: %s", multiUserVault.MasterKeyRotation.RotatedBy))
+		fmt.Println()
 	}
 
 	return nil
@@ -547,7 +622,7 @@ func secretsAdd() error {
 		if err := promptForUsername(); err != nil {
 			return err
 		}
-		canAccess, err := multiuser.UserCanAccessSecret(currentUsername, secretName)
+		canAccess, err := multiuser.UserCanAccessSecretInDir(vaultDir, currentUsername, secretName)
 		if err != nil {
 			return fmt.Errorf("failed to check access: %w", err)
 		}
@@ -654,7 +729,7 @@ func secretsAddFromFile(filePath string) error {
 		if err := promptForUsername(); err != nil {
 			return err
 		}
-		canAccess, err := multiuser.UserCanAccessSecret(currentUsername, secretName)
+		canAccess, err := multiuser.UserCanAccessSecretInDir(vaultDir, currentUsername, secretName)
 		if err != nil {
 			return fmt.Errorf("failed to check access: %w", err)
 		}
@@ -1261,6 +1336,12 @@ func secretsBackup() error {
 }
 
 func secretsInitMultiUser() error {
+	// Get active vault context first
+	vaultName, vaultDir, err := getActiveVaultContext()
+	if err != nil {
+		return err
+	}
+
 	ui.PrintPrompt("enter username for first admin: ")
 	var username string
 	fmt.Scanln(&username)
@@ -1302,20 +1383,21 @@ func secretsInitMultiUser() error {
 	}
 	defer crypto.CleanupBytes(masterKey)
 
-	if err := multiuser.InitMultiUserVault(username, userPass, masterKey); err != nil {
+	if err := multiuser.InitMultiUserVaultInDir(vaultDir, username, userPass, masterKey); err != nil {
 		return fmt.Errorf("could not initialize multi-user vault: %w", err)
 	}
 
-	if err := multiuser.CreateGroup(groupName, []string{username}, prefixes); err != nil {
+	if err := multiuser.CreateGroupInDir(vaultDir, groupName, []string{username}, prefixes); err != nil {
 		return fmt.Errorf("could not create initial group: %w", err)
 	}
 
 	fmt.Println()
 	ui.PrintSuccess("+", "multi-user vault initialized successfully!")
+	ui.PrintMuted(fmt.Sprintf("  vault: %s", vaultName))
 	ui.PrintMuted(fmt.Sprintf("  admin user: %s", username))
 	ui.PrintMuted(fmt.Sprintf("  initial group: %s", groupName))
 	ui.PrintMuted(fmt.Sprintf("  secret prefixes: %s", strings.Join(prefixes, ", ")))
-	ui.PrintMuted(fmt.Sprintf("  vault location: %s", multiuser.GetMultiUserVaultPath()))
+	ui.PrintMuted(fmt.Sprintf("  vault location: %s", vaultDir))
 	fmt.Println()
 	ui.PrintTip("tip: use 'secrets --group user add' to add more users")
 	ui.PrintTip("     use 'secrets --group group create' to create more access groups")
@@ -1367,7 +1449,13 @@ func userAdd() error {
 		return fmt.Errorf("user commands require --group flag or group mode. use 'mode' to toggle or run with --group")
 	}
 
-	isMultiUser, err := multiuser.IsMultiUserMode()
+	// Get vault directory
+	_, vaultDir, err := getActiveVaultContext()
+	if err != nil {
+		return err
+	}
+
+	isMultiUser, err := multiuser.IsMultiUserModeInDir(vaultDir)
 	if err != nil {
 		return fmt.Errorf("failed to check vault mode: %w", err)
 	}
@@ -1385,7 +1473,7 @@ func userAdd() error {
 	}
 	defer crypto.CleanupBytes(adminPassword)
 
-	masterKey, err := multiuser.GetMasterKeyForUser(adminUsername, adminPassword)
+	masterKey, err := multiuser.GetMasterKeyForUserInDir(vaultDir, adminUsername, adminPassword)
 	if err != nil {
 		return fmt.Errorf("failed to authenticate admin: %w", err)
 	}
@@ -1402,7 +1490,7 @@ func userAdd() error {
 	}
 	defer crypto.CleanupBytes(newPassword)
 
-	if err := multiuser.AddUserToVault(newUsername, newPassword, masterKey); err != nil {
+	if err := multiuser.AddUserToVaultInDir(vaultDir, newUsername, newPassword, masterKey); err != nil {
 		return fmt.Errorf("failed to add user: %w", err)
 	}
 
@@ -1420,7 +1508,13 @@ func userList() error {
 		return fmt.Errorf("user commands require --group flag or group mode. use 'mode' to toggle or run with --group")
 	}
 
-	isMultiUser, err := multiuser.IsMultiUserMode()
+	// Get vault directory
+	_, vaultDir, err := getActiveVaultContext()
+	if err != nil {
+		return err
+	}
+
+	isMultiUser, err := multiuser.IsMultiUserModeInDir(vaultDir)
 	if err != nil {
 		return fmt.Errorf("failed to check vault mode: %w", err)
 	}
@@ -1428,7 +1522,7 @@ func userList() error {
 		return fmt.Errorf("group vault is not in multi-user mode")
 	}
 
-	vault, err := multiuser.LoadMultiUserVault(multiuser.GetMultiUserVaultPath())
+	vault, err := multiuser.LoadMultiUserVault(multiuser.GetMultiUserVaultPathForVault(vaultDir))
 	if err != nil {
 		return fmt.Errorf("failed to load vault: %w", err)
 	}
@@ -1456,7 +1550,13 @@ func groupCreate() error {
 		return fmt.Errorf("group commands require --group flag or group mode. use 'mode' to toggle or run with --group")
 	}
 
-	isMultiUser, err := multiuser.IsMultiUserMode()
+	// Get vault directory
+	_, vaultDir, err := getActiveVaultContext()
+	if err != nil {
+		return err
+	}
+
+	isMultiUser, err := multiuser.IsMultiUserModeInDir(vaultDir)
 	if err != nil {
 		return fmt.Errorf("failed to check vault mode: %w", err)
 	}
@@ -1496,7 +1596,7 @@ func groupCreate() error {
 		break
 	}
 
-	if err := multiuser.CreateGroup(groupName, users, prefixes); err != nil {
+	if err := multiuser.CreateGroupInDir(vaultDir, groupName, users, prefixes); err != nil {
 		return fmt.Errorf("failed to create group: %w", err)
 	}
 
@@ -1516,7 +1616,13 @@ func groupList() error {
 		return fmt.Errorf("group commands require --group flag or group mode. use 'mode' to toggle or run with --group")
 	}
 
-	isMultiUser, err := multiuser.IsMultiUserMode()
+	// Get vault directory
+	_, vaultDir, err := getActiveVaultContext()
+	if err != nil {
+		return err
+	}
+
+	isMultiUser, err := multiuser.IsMultiUserModeInDir(vaultDir)
 	if err != nil {
 		return fmt.Errorf("failed to check vault mode: %w", err)
 	}
@@ -1524,7 +1630,7 @@ func groupList() error {
 		return fmt.Errorf("group vault is not in multi-user mode")
 	}
 
-	vault, err := multiuser.LoadMultiUserVault(multiuser.GetMultiUserVaultPath())
+	vault, err := multiuser.LoadMultiUserVault(multiuser.GetMultiUserVaultPathForVault(vaultDir))
 	if err != nil {
 		return fmt.Errorf("failed to load vault: %w", err)
 	}

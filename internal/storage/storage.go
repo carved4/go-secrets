@@ -21,11 +21,17 @@ type SecretMetadata struct {
 	UpdatedAt      time.Time `json:"updated_at"`
 }
 
+type MasterKeyRotation struct {
+	RotatedAt time.Time `json:"rotated_at"`
+	RotatedBy string    `json:"rotated_by"`
+}
+
 type Vault struct {
-	Secrets         map[string]string         `json:"secrets,omitempty"`
-	SecretsMetadata map[string]SecretMetadata `json:"secrets_metadata,omitempty"`
-	HMAC            string                    `json:"hmac"`
-	VaultID         string                    `json:"vault_id,omitempty"`
+	Secrets           map[string]string         `json:"secrets,omitempty"`
+	SecretsMetadata   map[string]SecretMetadata `json:"secrets_metadata,omitempty"`
+	HMAC              string                    `json:"hmac"`
+	VaultID           string                    `json:"vault_id,omitempty"`
+	MasterKeyRotation *MasterKeyRotation        `json:"master_key_rotation,omitempty"`
 }
 
 func InitVault() error {
