@@ -96,7 +96,7 @@ Multi-user vaults in this system are designed for **shared filesystem access**, 
 - DevOps teams on same infrastructure
 - Synchronized folder scenarios (Dropbox, etc.)
 
-❌ **Not ideal for:**
+**Not ideal for:**
 - Remote teams without shared storage
 - Large distributed teams
 - High-frequency concurrent access
