@@ -85,6 +85,10 @@ func GetVaultPathForVault(vaultDir string) string {
 	return filepath.Join(vaultDir, "vault.json")
 }
 
+func GetVaultMetadataIndexPath(vaultDir string) string {
+	return filepath.Join(vaultDir, "metadata-index.json")
+}
+
 func LoadVaultFromDir(vaultDir string) (*Vault, error) {
 	vaultPath := GetVaultPathForVault(vaultDir)
 	return LoadVault(vaultPath)
@@ -118,6 +122,71 @@ func InitVaultInDir(vaultDir string) error {
 func isWindows() bool {
 	return os.PathSeparator == '\\' && os.PathListSeparator == ';'
 }
+type SecretMetadataLite struct {
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type MetadataIndex struct {
+	Secrets map[string]SecretMetadataLite `json:"secrets"`
+}
+
+func LoadMetadataIndex(vaultDir string) (map[string]SecretMetadataLite, error) {
+	indexPath := GetVaultMetadataIndexPath(vaultDir)
+	data, err := os.ReadFile(indexPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return rebuildMetadataIndex(vaultDir)
+		}
+		return nil, err
+	}
+
+	var index MetadataIndex
+	if err := json.Unmarshal(data, &index); err != nil {
+		return rebuildMetadataIndex(vaultDir)
+	}
+
+	if index.Secrets == nil {
+		index.Secrets = make(map[string]SecretMetadataLite)
+	}
+
+	return index.Secrets, nil
+}
+
+func SaveMetadataIndex(vaultDir string, metadata map[string]SecretMetadataLite) error {
+	indexPath := GetVaultMetadataIndexPath(vaultDir)
+	index := MetadataIndex{
+		Secrets: metadata,
+	}
+
+	data, err := json.MarshalIndent(index, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(indexPath, data, 0600)
+}
+
+func rebuildMetadataIndex(vaultDir string) (map[string]SecretMetadataLite, error) {
+	vaultPath := GetVaultPathForVault(vaultDir)
+	vault, err := LoadVault(vaultPath)
+	if err != nil {
+		return nil, err
+	}
+
+	metadata := make(map[string]SecretMetadataLite)
+	for name, meta := range vault.SecretsMetadata {
+		metadata[name] = SecretMetadataLite{
+			CreatedAt: meta.CreatedAt,
+			UpdatedAt: meta.UpdatedAt,
+		}
+	}
+
+	SaveMetadataIndex(vaultDir, metadata)
+
+	return metadata, nil
+}
+
 func LoadVault(path string) (*Vault, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -129,7 +198,6 @@ func LoadVault(path string) (*Vault, error) {
 		return nil, err
 	}
 
-	// Migrate old format to new format with metadata
 	if vault.Secrets != nil && vault.SecretsMetadata == nil {
 		vault.SecretsMetadata = make(map[string]SecretMetadata)
 		for name, encValue := range vault.Secrets {
@@ -173,6 +241,17 @@ func SaveVault(path string, vault *Vault) error {
 		log.Printf("SaveVault: failed to write file %s: %v", path, err)
 		return fmt.Errorf("failed to write vault file: %w", err)
 	}
+
+	vaultDir := filepath.Dir(path)
+	metadata := make(map[string]SecretMetadataLite)
+	for name, meta := range vault.SecretsMetadata {
+		metadata[name] = SecretMetadataLite{
+			CreatedAt: meta.CreatedAt,
+			UpdatedAt: meta.UpdatedAt,
+		}
+	}
+	SaveMetadataIndex(vaultDir, metadata)
+
 	return nil
 }
 

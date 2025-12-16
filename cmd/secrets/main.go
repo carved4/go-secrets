@@ -272,6 +272,13 @@ func executeCommand(args []string) error {
 			}
 			return secretsAddFromFile(args[2])
 		}
+		if len(args) > 1 && args[1] == "--folder" {
+			if len(args) < 3 {
+				ui.PrintError("x", "usage: secrets add --folder <folderpath>")
+				return nil
+			}
+			return secretsAddFromFolder(args[2])
+		}
 		return secretsAdd()
 	case "get":
 		if len(args) < 2 {
@@ -284,8 +291,11 @@ func executeCommand(args []string) error {
 		return secretsList()
 	case "delete":
 		if len(args) < 2 {
-			ui.PrintError("x", "usage: secrets delete <name>")
+			ui.PrintError("x", "usage: secrets delete <name> [--folder]")
 			return nil
+		}
+		if len(args) > 2 && args[2] == "--folder" {
+			return secretsDeleteFolder(args[1])
 		}
 		return secretsDelete(args[1])
 	case "env":
@@ -341,14 +351,17 @@ func executeCommand(args []string) error {
 		return handleVaultCommand(args[1:])
 	case "restore":
 		if len(args) < 2 {
-			ui.PrintError("x", "usage: secrets restore <name> [--output <path>]")
+			ui.PrintError("x", "usage: secrets restore <name> [--output <path>] [--folder]")
 			return nil
 		}
 		return secretsRestore(args[1:])
 	case "wipe":
 		if len(args) < 2 {
-			ui.PrintError("x", "usage: secrets wipe <filepath>")
+			ui.PrintError("x", "usage: secrets wipe <path> [--folder]")
 			return nil
+		}
+		if len(args) > 2 && args[2] == "--folder" {
+			return secretsWipeFolder(args[1])
 		}
 		return secretsWipeFile(args[1])
 	default:
@@ -376,9 +389,11 @@ func printUsage() {
 	ui.PrintListItem("  >", "init           initialize a new secrets vault")
 	ui.PrintListItem("  >", "add            add a new secret from clipboard")
 	ui.PrintListItem("  >", "add --file <path>  add a secret from file")
+	ui.PrintListItem("  >", "add --folder <path>  add all files from a folder")
 	ui.PrintListItem("  >", "get <name> [--clip]  retrieve a secret")
 	ui.PrintListItem("  >", "list           list all secret names")
 	ui.PrintListItem("  >", "delete <name>  delete a secret")
+	ui.PrintListItem("  >", "delete <name> --folder  delete all files in a folder")
 	ui.PrintListItem("  >", "env run -- <cmd>  run command with secrets as env vars")
 	ui.PrintListItem("  >", "export <file>  export encrypted backup to file")
 	ui.PrintListItem("  >", "import <file>  import secrets from encrypted backup")
@@ -388,7 +403,9 @@ func printUsage() {
 	ui.PrintListItem("  >", "rotate [name]  rotate all secrets or a specific secret")
 	ui.PrintListItem("  >", "rotate --master-key  rotate the master encryption key")
 	ui.PrintListItem("  >", "restore <name> [--output <path>]  restore secret to file")
+	ui.PrintListItem("  >", "restore <name> --folder [--output <path>]  restore folder")
 	ui.PrintListItem("  >", "wipe <path>    securely delete a file")
+	ui.PrintListItem("  >", "wipe <path> --folder  securely delete entire folder")
 	fmt.Println()
 	ui.PrintInfo("*", "vault management:")
 	fmt.Println()
@@ -411,12 +428,16 @@ func printUsage() {
 	ui.PrintMuted("  secrets --group init            # create group vault")
 	ui.PrintMuted("  secrets add                     # add to solo vault")
 	ui.PrintMuted("  secrets add --file secret.txt   # add from file")
+	ui.PrintMuted("  secrets add --folder ./configs  # add entire folder")
 	ui.PrintMuted("  secrets import-passwords passwords.csv  # import Chrome passwords")
 	ui.PrintMuted("  secrets rotate                  # rotate all secrets")
 	ui.PrintMuted("  secrets rotate API_KEY          # rotate specific secret")
 	ui.PrintMuted("  secrets rotate --master-key     # rotate master encryption key")
 	ui.PrintMuted("  secrets restore DB_FILE --output ./database.db  # restore file secret")
+	ui.PrintMuted("  secrets restore MY_CONFIGS --folder --output ./restored  # restore folder")
+	ui.PrintMuted("  secrets delete MY_CONFIGS --folder  # delete entire folder from vault")
 	ui.PrintMuted("  secrets wipe ./database.db      # securely delete file")
+	ui.PrintMuted("  secrets wipe ./restored-folder --folder  # securely delete entire folder")
 	ui.PrintMuted("  secrets --group add             # add to group vault")
 	ui.PrintMuted("  secrets --group user add        # add user to group vault")
 	fmt.Println()
@@ -844,6 +865,227 @@ func secretsAddFromFile(filePath string) error {
 	return nil
 }
 
+func secretsAddFromFolder(folderPath string) error {
+	ui.PrintTitle("adding folder to vault")
+	fmt.Println()
+
+	if err := storage.CheckRateLimit(); err != nil {
+		return err
+	}
+
+	folderInfo, err := os.Stat(folderPath)
+	if err != nil {
+		ui.PrintError("x", fmt.Sprintf("failed to access folder: %v", err))
+		fmt.Println()
+		return fmt.Errorf("failed to access folder: %w", err)
+	}
+
+	if !folderInfo.IsDir() {
+		ui.PrintError("x", "path is not a directory")
+		fmt.Println()
+		return fmt.Errorf("path is not a directory: %s", folderPath)
+	}
+
+	var files []string
+	var totalSize int64
+	err = filepath.Walk(folderPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			files = append(files, path)
+			totalSize += info.Size()
+		}
+		return nil
+	})
+	if err != nil {
+		ui.PrintError("x", fmt.Sprintf("failed to scan folder: %v", err))
+		fmt.Println()
+		return fmt.Errorf("failed to scan folder: %w", err)
+	}
+
+	if len(files) == 0 {
+		ui.PrintWarning("!", "no files found in folder")
+		fmt.Println()
+		return nil
+	}
+
+	ui.PrintSuccess("+", fmt.Sprintf("found %d file(s) in folder", len(files)))
+	if totalSize < 1024 {
+		ui.PrintMuted(fmt.Sprintf("  total size: %d bytes", totalSize))
+	} else if totalSize < 1024*1024 {
+		ui.PrintMuted(fmt.Sprintf("  total size: %.2f KB", float64(totalSize)/1024))
+	} else if totalSize < 1024*1024*1024 {
+		ui.PrintMuted(fmt.Sprintf("  total size: %.2f MB", float64(totalSize)/(1024*1024)))
+	} else {
+		ui.PrintMuted(fmt.Sprintf("  total size: %.2f GB", float64(totalSize)/(1024*1024*1024)))
+	}
+	fmt.Println()
+
+	masterKey, vaultDir, err := authenticateVault()
+	if err != nil {
+		return err
+	}
+	defer crypto.CleanupBytes(masterKey)
+
+	ui.PrintPrompt("enter a name for this folder backup: ")
+	var folderName string
+	fmt.Scanln(&folderName)
+	
+	if folderName == "" {
+		return fmt.Errorf("folder name cannot be empty")
+	}
+
+	if useGroupVault {
+		if err := promptForUsername(); err != nil {
+			return err
+		}
+	}
+
+	vault, err := storage.LoadVaultFromDir(vaultDir)
+	if err != nil {
+		return fmt.Errorf("failed to load vault: %w", err)
+	}
+
+	fmt.Println()
+	ui.PrintInfo(">", "encrypting files...")
+	fmt.Println()
+
+	absFolderPath, err := filepath.Abs(folderPath)
+	if err != nil {
+		return fmt.Errorf("failed to get absolute path: %w", err)
+	}
+
+	successCount := 0
+	failCount := 0
+
+	for i, filePath := range files {
+		relPath, err := filepath.Rel(absFolderPath, filePath)
+		if err != nil {
+			ui.PrintError("x", fmt.Sprintf("  %d/%d: %s - failed to get relative path", i+1, len(files), filepath.Base(filePath)))
+			failCount++
+			continue
+		}
+
+		relPathForward := filepath.ToSlash(relPath)
+		secretName := fmt.Sprintf("%s__%s", folderName, relPathForward)
+
+		if useGroupVault {
+			canAccess, err := multiuser.UserCanAccessSecretInDir(vaultDir, currentUsername, secretName)
+			if err != nil || !canAccess {
+				ui.PrintError("x", fmt.Sprintf("  %d/%d: %s - access denied", i+1, len(files), relPath))
+				failCount++
+				continue
+			}
+		}
+
+		fileInfo, err := os.Stat(filePath)
+		if err != nil {
+			ui.PrintError("x", fmt.Sprintf("  %d/%d: %s - failed to stat", i+1, len(files), relPath))
+			failCount++
+			continue
+		}
+
+		fileSize := fileInfo.Size()
+		useStreaming := fileSize > 100*1024*1024
+
+		var encryptedValue string
+
+		if useStreaming {
+			file, err := os.Open(filePath)
+			if err != nil {
+				ui.PrintError("x", fmt.Sprintf("  %d/%d: %s - failed to open", i+1, len(files), relPath))
+				failCount++
+				continue
+			}
+
+			var encryptedBuf strings.Builder
+			_, err = crypto.EncryptStream(file, &encryptedBuf, masterKey)
+			file.Close()
+			
+			if err != nil {
+				ui.PrintError("x", fmt.Sprintf("  %d/%d: %s - encryption failed", i+1, len(files), relPath))
+				failCount++
+				continue
+			}
+
+			encryptedBytes := []byte(encryptedBuf.String())
+			encryptedValue = fmt.Sprintf("%x", encryptedBytes)
+		} else {
+			fileData, err := os.ReadFile(filePath)
+			if err != nil {
+				ui.PrintError("x", fmt.Sprintf("  %d/%d: %s - failed to read", i+1, len(files), relPath))
+				failCount++
+				continue
+			}
+
+			encryptedSecret, err := crypto.EncryptSecret(fileData, masterKey)
+			if err != nil {
+				ui.PrintError("x", fmt.Sprintf("  %d/%d: %s - encryption failed", i+1, len(files), relPath))
+				failCount++
+				continue
+			}
+			encryptedValue = fmt.Sprintf("%x", encryptedSecret)
+		}
+
+		now := time.Now()
+		existing, exists := vault.SecretsMetadata[secretName]
+		if exists {
+			vault.SecretsMetadata[secretName] = storage.SecretMetadata{
+				EncryptedValue: encryptedValue,
+				CreatedAt:      existing.CreatedAt,
+				UpdatedAt:      now,
+			}
+		} else {
+			vault.SecretsMetadata[secretName] = storage.SecretMetadata{
+				EncryptedValue: encryptedValue,
+				CreatedAt:      now,
+				UpdatedAt:      now,
+			}
+		}
+
+		ui.PrintSuccess("+", fmt.Sprintf("  %d/%d: %s", i+1, len(files), relPath))
+		successCount++
+	}
+
+	if err := storage.SaveVaultToDir(vaultDir, vault); err != nil {
+		audit.LogEventForVault(vaultDir, currentUsername, "add-folder", folderName, false, err.Error(), masterKey)
+		return fmt.Errorf("failed to save vault: %w", err)
+	}
+
+	audit.LogEventForVault(vaultDir, currentUsername, "add-folder", folderName, true, fmt.Sprintf("%d files", successCount), masterKey)
+
+	fmt.Println()
+	ui.PrintSuccess("+", fmt.Sprintf("folder '%s' added successfully!", folderName))
+	ui.PrintMuted(fmt.Sprintf("  %d file(s) encrypted and stored", successCount))
+	if failCount > 0 {
+		ui.PrintWarning("!", fmt.Sprintf("  %d file(s) failed", failCount))
+	}
+	fmt.Println()
+
+	ui.PrintWarning("!", "delete the source folder for security?")
+	ui.PrintPrompt("remove folder? (yes/no): ")
+	var confirm string
+	fmt.Scanln(&confirm)
+
+	if confirm == "yes" || confirm == "y" {
+		if err := os.RemoveAll(folderPath); err != nil {
+			ui.PrintError("x", fmt.Sprintf("failed to remove folder: %v", err))
+			ui.PrintMuted("  you may need to delete it manually")
+		} else {
+			ui.PrintSuccess("+", "source folder removed")
+		}
+	} else {
+		ui.PrintWarning("!", "source folder kept - remember to delete it manually!")
+	}
+
+	fmt.Println()
+	ui.PrintTip(fmt.Sprintf("tip: use 'secrets restore %s --folder' to restore all files", folderName))
+	ui.PrintTip("     folder structure will be preserved during restore")
+	fmt.Println()
+	return nil
+}
+
 type clipboardClearToken struct {
 	token string
 	value string
@@ -960,8 +1202,6 @@ func secretsList() error {
 	if err != nil {
 		return err
 	}
-
-	// Check if vault is initialized
 	if !keyring.VaultKeyringExists(vaultDir) {
 		ui.PrintWarning("!", fmt.Sprintf("vault '%s' has not been initialized yet", vaultName))
 		fmt.Println()
@@ -970,35 +1210,35 @@ func secretsList() error {
 		return nil
 	}
 
-	vault, err := storage.LoadVaultFromDir(vaultDir)
+	metadata, err := storage.LoadMetadataIndex(vaultDir)
 	if err != nil {
 		return fmt.Errorf("failed to list secrets: %w", err)
 	}
 
-	if len(vault.SecretsMetadata) == 0 {
+	if len(metadata) == 0 {
 		ui.PrintMuted("no secrets stored yet")
 		fmt.Println()
 		return nil
 	}
 
-	ui.PrintInfo("*", fmt.Sprintf("found %d secret(s):", len(vault.SecretsMetadata)))
+	ui.PrintInfo("*", fmt.Sprintf("found %d secret(s):", len(metadata)))
 	fmt.Println()
 
-	names := make([]string, 0, len(vault.SecretsMetadata))
-	for name := range vault.SecretsMetadata {
+	names := make([]string, 0, len(metadata))
+	for name := range metadata {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 
 	for _, name := range names {
-		metadata := vault.SecretsMetadata[name]
-		age := time.Since(metadata.CreatedAt)
+		meta := metadata[name]
+		age := time.Since(meta.CreatedAt)
 		ageStr := formatDuration(age)
 
-		if metadata.CreatedAt.Equal(metadata.UpdatedAt) {
+		if meta.CreatedAt.Equal(meta.UpdatedAt) {
 			ui.PrintSuccess("  +", fmt.Sprintf("%s (created %s ago)", name, ageStr))
 		} else {
-			updateAge := time.Since(metadata.UpdatedAt)
+			updateAge := time.Since(meta.UpdatedAt)
 			ui.PrintSuccess("  +", fmt.Sprintf("%s (created %s ago, updated %s ago)", name, ageStr, formatDuration(updateAge)))
 		}
 	}
@@ -1061,7 +1301,6 @@ func secretsDelete(secretName string) error {
 	}
 	defer crypto.CleanupBytes(masterKey)
 
-	// Check access control for multi-user mode
 	if useGroupVault {
 		if err := promptForUsername(); err != nil {
 			return err
@@ -1095,6 +1334,111 @@ func secretsDelete(secretName string) error {
 	audit.LogEventForVault(vaultDir, currentUsername, "delete", secretName, true, "", masterKey)
 
 	ui.PrintSuccess("+", fmt.Sprintf("secret '%s' deleted successfully", secretName))
+	fmt.Println()
+	return nil
+}
+
+func secretsDeleteFolder(folderName string) error {
+	ui.PrintTitle("deleting folder from vault")
+	fmt.Println()
+
+	if err := storage.CheckRateLimit(); err != nil {
+		return err
+	}
+
+	masterKey, vaultDir, err := authenticateVault()
+	if err != nil {
+		return err
+	}
+	defer crypto.CleanupBytes(masterKey)
+
+	if useGroupVault {
+		if err := promptForUsername(); err != nil {
+			return err
+		}
+	}
+
+	vault, err := storage.LoadVaultFromDir(vaultDir)
+	if err != nil {
+		return fmt.Errorf("failed to load vault: %w", err)
+	}
+
+	prefix := folderName + "__"
+	var folderSecrets []string
+	for secretName := range vault.SecretsMetadata {
+		if strings.HasPrefix(secretName, prefix) {
+			folderSecrets = append(folderSecrets, secretName)
+		}
+	}
+
+	if len(folderSecrets) == 0 {
+		return fmt.Errorf("no secrets found for folder '%s'", folderName)
+	}
+
+	ui.PrintWarning("!", fmt.Sprintf("this will delete %d file(s) from folder '%s':", len(folderSecrets), folderName))
+	fmt.Println()
+
+	previewCount := len(folderSecrets)
+	if previewCount > 10 {
+		previewCount = 10
+	}
+	sort.Strings(folderSecrets)
+	for i := 0; i < previewCount; i++ {
+		relPath := strings.TrimPrefix(folderSecrets[i], prefix)
+		ui.PrintMuted(fmt.Sprintf("  - %s", relPath))
+	}
+	if len(folderSecrets) > 10 {
+		ui.PrintMuted(fmt.Sprintf("  ... and %d more", len(folderSecrets)-10))
+	}
+	fmt.Println()
+
+	ui.PrintPrompt("continue? (yes/no): ")
+	var confirm string
+	fmt.Scanln(&confirm)
+
+	if confirm != "yes" && confirm != "y" {
+		ui.PrintMuted("deletion cancelled")
+		fmt.Println()
+		return nil
+	}
+
+	fmt.Println()
+	ui.PrintInfo(">", "deleting files...")
+	fmt.Println()
+
+	successCount := 0
+	failCount := 0
+
+	for i, secretName := range folderSecrets {
+		relPath := strings.TrimPrefix(secretName, prefix)
+
+		if useGroupVault {
+			canAccess, err := multiuser.UserCanAccessSecret(currentUsername, secretName)
+			if err != nil || !canAccess {
+				ui.PrintError("x", fmt.Sprintf("  %d/%d: %s - access denied", i+1, len(folderSecrets), relPath))
+				failCount++
+				continue
+			}
+		}
+
+		delete(vault.SecretsMetadata, secretName)
+		ui.PrintSuccess("+", fmt.Sprintf("  %d/%d: %s", i+1, len(folderSecrets), relPath))
+		successCount++
+	}
+
+	if err := storage.SaveVaultToDir(vaultDir, vault); err != nil {
+		audit.LogEventForVault(vaultDir, currentUsername, "delete-folder", folderName, false, err.Error(), masterKey)
+		return fmt.Errorf("failed to save vault: %w", err)
+	}
+
+	audit.LogEventForVault(vaultDir, currentUsername, "delete-folder", folderName, true, fmt.Sprintf("%d files", successCount), masterKey)
+
+	fmt.Println()
+	ui.PrintSuccess("+", fmt.Sprintf("folder '%s' deleted successfully!", folderName))
+	ui.PrintMuted(fmt.Sprintf("  %d file(s) deleted", successCount))
+	if failCount > 0 {
+		ui.PrintWarning("!", fmt.Sprintf("  %d file(s) failed", failCount))
+	}
 	fmt.Println()
 	return nil
 }
@@ -1942,23 +2286,30 @@ func vaultInfo() error {
 }
 
 func secretsRestore(args []string) error {
-	ui.PrintTitle("restoring secret to file")
-	fmt.Println()
-
 	if len(args) < 1 {
-		ui.PrintError("x", "usage: secrets restore <name> [--output <path>]")
+		ui.PrintError("x", "usage: secrets restore <name> [--output <path>] [--folder]")
 		return nil
 	}
 
 	secretName := args[0]
 	var outputPath string
+	isFolder := false
 
 	for i := 1; i < len(args); i++ {
 		if args[i] == "--output" && i+1 < len(args) {
 			outputPath = args[i+1]
-			break
+			i++
+		} else if args[i] == "--folder" {
+			isFolder = true
 		}
 	}
+
+	if isFolder {
+		return secretsRestoreFolder(secretName, outputPath)
+	}
+
+	ui.PrintTitle("restoring secret to file")
+	fmt.Println()
 
 	if err := storage.CheckRateLimit(); err != nil {
 		return err
@@ -2103,6 +2454,187 @@ func secretsRestore(args []string) error {
 	return nil
 }
 
+func secretsRestoreFolder(folderName string, outputPath string) error {
+	ui.PrintTitle("restoring folder from vault")
+	fmt.Println()
+
+	if err := storage.CheckRateLimit(); err != nil {
+		return err
+	}
+
+	ui.PrintSuccess(">", fmt.Sprintf("restoring folder: %s", folderName))
+	fmt.Println()
+
+	masterKey, vaultDir, err := authenticateVault()
+	if err != nil {
+		return err
+	}
+	defer crypto.CleanupBytes(masterKey)
+
+	if useGroupVault {
+		if err := promptForUsername(); err != nil {
+			return err
+		}
+	}
+
+	vault, err := storage.LoadVaultFromDir(vaultDir)
+	if err != nil {
+		return fmt.Errorf("failed to load vault: %w", err)
+	}
+
+	prefix := folderName + "__"
+	var folderSecrets []string
+	for secretName := range vault.SecretsMetadata {
+		if strings.HasPrefix(secretName, prefix) {
+			folderSecrets = append(folderSecrets, secretName)
+		}
+	}
+
+	if len(folderSecrets) == 0 {
+		return fmt.Errorf("no secrets found for folder '%s' - use 'secrets list' to see available secrets", folderName)
+	}
+
+	ui.PrintInfo("*", fmt.Sprintf("found %d file(s) in folder backup", len(folderSecrets)))
+	fmt.Println()
+
+	if outputPath == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("failed to get current directory: %w", err)
+		}
+		outputPath = filepath.Join(cwd, folderName)
+		ui.PrintMuted(fmt.Sprintf("  using default path: %s", outputPath))
+		fmt.Println()
+	}
+
+	if _, err := os.Stat(outputPath); err == nil {
+		ui.PrintWarning("!", fmt.Sprintf("directory already exists: %s", outputPath))
+		ui.PrintPrompt("overwrite contents? (yes/no): ")
+		var confirm string
+		fmt.Scanln(&confirm)
+		if confirm != "yes" && confirm != "y" {
+			ui.PrintMuted("restore cancelled")
+			fmt.Println()
+			return nil
+		}
+	}
+
+	if err := os.MkdirAll(outputPath, 0700); err != nil {
+		return fmt.Errorf("failed to create output directory: %w", err)
+	}
+
+	ui.PrintInfo(">", "restoring files...")
+	fmt.Println()
+
+	successCount := 0
+	failCount := 0
+	var totalBytesWritten int64
+
+	sort.Strings(folderSecrets)
+
+	for i, secretName := range folderSecrets {
+		relPath := strings.TrimPrefix(secretName, prefix)
+		relPath = filepath.FromSlash(relPath)
+		
+		fullOutputPath := filepath.Join(outputPath, relPath)
+
+		if useGroupVault {
+			canAccess, err := multiuser.UserCanAccessSecret(currentUsername, secretName)
+			if err != nil || !canAccess {
+				ui.PrintError("x", fmt.Sprintf("  %d/%d: %s - access denied", i+1, len(folderSecrets), relPath))
+				failCount++
+				continue
+			}
+		}
+
+		metadata, exists := vault.SecretsMetadata[secretName]
+		if !exists {
+			ui.PrintError("x", fmt.Sprintf("  %d/%d: %s - not found", i+1, len(folderSecrets), relPath))
+			failCount++
+			continue
+		}
+
+		encryptedBytes := make([]byte, len(metadata.EncryptedValue)/2)
+		_, err = fmt.Sscanf(metadata.EncryptedValue, "%x", &encryptedBytes)
+		if err != nil {
+			ui.PrintError("x", fmt.Sprintf("  %d/%d: %s - failed to decode", i+1, len(folderSecrets), relPath))
+			failCount++
+			continue
+		}
+
+		parentDir := filepath.Dir(fullOutputPath)
+		if err := os.MkdirAll(parentDir, 0700); err != nil {
+			ui.PrintError("x", fmt.Sprintf("  %d/%d: %s - failed to create directory", i+1, len(folderSecrets), relPath))
+			failCount++
+			continue
+		}
+
+		isStreamed := crypto.IsStreamEncrypted(encryptedBytes)
+		var bytesWritten int64
+
+		if isStreamed {
+			outFile, err := os.OpenFile(fullOutputPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+			if err != nil {
+				ui.PrintError("x", fmt.Sprintf("  %d/%d: %s - failed to create file", i+1, len(folderSecrets), relPath))
+				failCount++
+				continue
+			}
+
+			encryptedReader := strings.NewReader(string(encryptedBytes))
+			bytesWritten, err = crypto.DecryptStream(encryptedReader, outFile, masterKey)
+			outFile.Close()
+
+			if err != nil {
+				ui.PrintError("x", fmt.Sprintf("  %d/%d: %s - decryption failed", i+1, len(folderSecrets), relPath))
+				failCount++
+				continue
+			}
+		} else {
+			secret, err := crypto.DecryptSecret(encryptedBytes, masterKey)
+			if err != nil {
+				ui.PrintError("x", fmt.Sprintf("  %d/%d: %s - decryption failed", i+1, len(folderSecrets), relPath))
+				failCount++
+				continue
+			}
+
+			if err := os.WriteFile(fullOutputPath, secret, 0600); err != nil {
+				ui.PrintError("x", fmt.Sprintf("  %d/%d: %s - failed to write", i+1, len(folderSecrets), relPath))
+				failCount++
+				continue
+			}
+
+			bytesWritten = int64(len(secret))
+		}
+
+		totalBytesWritten += bytesWritten
+		ui.PrintSuccess("+", fmt.Sprintf("  %d/%d: %s", i+1, len(folderSecrets), relPath))
+		successCount++
+	}
+
+	audit.LogEventForVault(vaultDir, currentUsername, "restore-folder", folderName, true, fmt.Sprintf("%d files", successCount), masterKey)
+
+	fmt.Println()
+	ui.PrintSuccess("+", fmt.Sprintf("folder '%s' restored to: %s", folderName, outputPath))
+	ui.PrintMuted(fmt.Sprintf("  %d file(s) restored successfully", successCount))
+	if failCount > 0 {
+		ui.PrintWarning("!", fmt.Sprintf("  %d file(s) failed", failCount))
+	}
+	if totalBytesWritten < 1024 {
+		ui.PrintMuted(fmt.Sprintf("  total size: %d bytes", totalBytesWritten))
+	} else if totalBytesWritten < 1024*1024 {
+		ui.PrintMuted(fmt.Sprintf("  total size: %.2f KB", float64(totalBytesWritten)/1024))
+	} else if totalBytesWritten < 1024*1024*1024 {
+		ui.PrintMuted(fmt.Sprintf("  total size: %.2f MB", float64(totalBytesWritten)/(1024*1024)))
+	} else {
+		ui.PrintMuted(fmt.Sprintf("  total size: %.2f GB", float64(totalBytesWritten)/(1024*1024*1024)))
+	}
+	fmt.Println()
+	ui.PrintWarning("!", "remember to securely delete restored files when done!")
+	ui.PrintTip(fmt.Sprintf("tip: use 'secrets wipe %s --folder' to securely delete when done", outputPath))
+	fmt.Println()
+	return nil
+}
+
 func secretsWipeFile(filePath string) error {
 	ui.PrintTitle("securely wiping file")
 	fmt.Println()
@@ -2194,6 +2726,169 @@ func secretsWipeFile(filePath string) error {
 	fmt.Println()
 	ui.PrintSuccess("+", "file securely wiped and deleted!")
 	ui.PrintMuted(fmt.Sprintf("  removed: %s", filePath))
+	fmt.Println()
+	return nil
+}
+
+func secretsWipeFolder(folderPath string) error {
+	ui.PrintTitle("securely wiping folder")
+	fmt.Println()
+
+	folderInfo, err := os.Stat(folderPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("folder does not exist: %s", folderPath)
+		}
+		return fmt.Errorf("failed to stat folder: %w", err)
+	}
+
+	if !folderInfo.IsDir() {
+		return fmt.Errorf("path is not a directory: %s", folderPath)
+	}
+
+	var files []string
+	var totalSize int64
+	err = filepath.Walk(folderPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			files = append(files, path)
+			totalSize += info.Size()
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to scan folder: %w", err)
+	}
+
+	if len(files) == 0 {
+		ui.PrintWarning("!", "no files found in folder")
+		fmt.Println()
+		return nil
+	}
+
+	ui.PrintWarning("!", fmt.Sprintf("this will securely delete folder: %s", folderPath))
+	ui.PrintMuted(fmt.Sprintf("  contains %d file(s)", len(files)))
+	if totalSize < 1024 {
+		ui.PrintMuted(fmt.Sprintf("  total size: %d bytes", totalSize))
+	} else if totalSize < 1024*1024 {
+		ui.PrintMuted(fmt.Sprintf("  total size: %.2f KB", float64(totalSize)/1024))
+	} else if totalSize < 1024*1024*1024 {
+		ui.PrintMuted(fmt.Sprintf("  total size: %.2f MB", float64(totalSize)/(1024*1024)))
+	} else {
+		ui.PrintMuted(fmt.Sprintf("  total size: %.2f GB", float64(totalSize)/(1024*1024*1024)))
+	}
+	fmt.Println()
+
+	ui.PrintPrompt("confirm deletion? (yes/no): ")
+	var confirm string
+	fmt.Scanln(&confirm)
+
+	if confirm != "yes" && confirm != "y" {
+		ui.PrintMuted("deletion cancelled")
+		fmt.Println()
+		return nil
+	}
+
+	fmt.Println()
+	ui.PrintInfo(">", "securely wiping files...")
+	fmt.Println()
+
+	successCount := 0
+	failCount := 0
+
+	for i, filePath := range files {
+		relPath, _ := filepath.Rel(folderPath, filePath)
+
+		fileInfo, err := os.Stat(filePath)
+		if err != nil {
+			ui.PrintError("x", fmt.Sprintf("  %d/%d: %s - failed to stat", i+1, len(files), relPath))
+			failCount++
+			continue
+		}
+
+		fileSize := fileInfo.Size()
+
+		file, err := os.OpenFile(filePath, os.O_WRONLY, 0600)
+		if err != nil {
+			ui.PrintError("x", fmt.Sprintf("  %d/%d: %s - failed to open", i+1, len(files), relPath))
+			failCount++
+			continue
+		}
+
+		bufferSize := 1024 * 1024
+		if fileSize < int64(bufferSize) {
+			bufferSize = int(fileSize)
+		}
+		buffer := make([]byte, bufferSize)
+
+		wiped := true
+		for pass := 1; pass <= 3; pass++ {
+			if _, err := file.Seek(0, 0); err != nil {
+				ui.PrintError("x", fmt.Sprintf("  %d/%d: %s - wipe failed at pass %d", i+1, len(files), relPath, pass))
+				wiped = false
+				break
+			}
+
+			remaining := fileSize
+			for remaining > 0 {
+				writeSize := int64(bufferSize)
+				if remaining < writeSize {
+					writeSize = remaining
+				}
+
+				if _, err := io.ReadFull(rand.Reader, buffer[:writeSize]); err != nil {
+					wiped = false
+					break
+				}
+
+				if _, err := file.Write(buffer[:writeSize]); err != nil {
+					wiped = false
+					break
+				}
+
+				remaining -= writeSize
+			}
+
+			if !wiped {
+				break
+			}
+
+			file.Sync()
+		}
+
+		file.Close()
+
+		if !wiped {
+			ui.PrintError("x", fmt.Sprintf("  %d/%d: %s - wipe failed", i+1, len(files), relPath))
+			failCount++
+			continue
+		}
+
+		if err := os.Remove(filePath); err != nil {
+			ui.PrintError("x", fmt.Sprintf("  %d/%d: %s - failed to remove", i+1, len(files), relPath))
+			failCount++
+			continue
+		}
+
+		ui.PrintSuccess("+", fmt.Sprintf("  %d/%d: %s", i+1, len(files), relPath))
+		successCount++
+	}
+
+	if successCount > 0 {
+		if err := os.RemoveAll(folderPath); err != nil {
+			ui.PrintWarning("!", fmt.Sprintf("failed to remove folder structure: %v", err))
+		}
+	}
+
+	fmt.Println()
+	ui.PrintSuccess("+", "folder securely wiped and deleted!")
+	ui.PrintMuted(fmt.Sprintf("  %d file(s) wiped successfully", successCount))
+	if failCount > 0 {
+		ui.PrintWarning("!", fmt.Sprintf("  %d file(s) failed", failCount))
+	}
+	ui.PrintMuted(fmt.Sprintf("  removed: %s", folderPath))
 	fmt.Println()
 	return nil
 }
@@ -2377,4 +3072,5 @@ func secretsImportPasswords(csvFile string) error {
 
 	return nil
 }
+
 
