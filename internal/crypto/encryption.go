@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"runtime/secret"
 	"strings"
 	"sync"
 	"syscall"
@@ -129,134 +130,158 @@ func ReadUserSecret() (string, error) {
 	return strings.Join(lines, ""), nil
 }
 func DeriveKeyFromUserPass(password []byte, salt []byte) (derivedKey []byte, usedSalt []byte, err error) {
-	// Only generate salt if none provided
-	if len(salt) == 0 {
-		salt = make([]byte, 16)
-		if _, err := io.ReadFull(rand.Reader, salt); err != nil {
-			log.Println("could not generate salt")
-			return nil, nil, err
+	secret.Do(func() {
+		// Only generate salt if none provided
+		if len(salt) == 0 {
+			salt = make([]byte, 16)
+			if _, err = io.ReadFull(rand.Reader, salt); err != nil {
+				log.Println("could not generate salt")
+				return
+			}
 		}
-	}
-	iterations := 600000
-	keyLength := 32
-	derivedKey = pbkdf2.Key(password, salt, iterations, keyLength, sha256.New)
-	return derivedKey, salt, nil
+		iterations := 600000
+		keyLength := 32
+		derivedKey = pbkdf2.Key(password, salt, iterations, keyLength, sha256.New)
+		usedSalt = salt
+	})
+	return derivedKey, usedSalt, err
 }
 
 func DeriveVaultKey(password []byte, vaultName string, salt []byte) (derivedKey []byte, usedSalt []byte, err error) {
-	// Only generate salt if none provided
-	if len(salt) == 0 {
-		salt = make([]byte, 16)
-		if _, err := io.ReadFull(rand.Reader, salt); err != nil {
-			log.Println("could not generate salt")
-			return nil, nil, err
+	secret.Do(func() {
+		// Only generate salt if none provided
+		if len(salt) == 0 {
+			salt = make([]byte, 16)
+			if _, err = io.ReadFull(rand.Reader, salt); err != nil {
+				log.Println("could not generate salt")
+				return
+			}
 		}
-	}
-	
-	// Mix vault context into password for vault-specific key derivation
-	// This ensures each vault has a cryptographically independent master key
-	// even when using the same passphrase
-	h := sha256.New()
-	h.Write(password)
-	h.Write([]byte("::vault-context::"))
-	h.Write([]byte(vaultName))
-	contextualPassword := h.Sum(nil)
-	defer ZeroMemory(contextualPassword)
-	
-	iterations := 600000
-	keyLength := 32
-	derivedKey = pbkdf2.Key(contextualPassword, salt, iterations, keyLength, sha256.New)
-	return derivedKey, salt, nil
+
+		// Mix vault context into password for vault-specific key derivation
+		// This ensures each vault has a cryptographically independent master key
+		// even when using the same passphrase
+		h := sha256.New()
+		h.Write(password)
+		h.Write([]byte("::vault-context::"))
+		h.Write([]byte(vaultName))
+		contextualPassword := h.Sum(nil)
+		defer ZeroMemory(contextualPassword)
+
+		iterations := 600000
+		keyLength := 32
+		derivedKey = pbkdf2.Key(contextualPassword, salt, iterations, keyLength, sha256.New)
+		usedSalt = salt
+	})
+	return derivedKey, usedSalt, err
 }
 
-func EncryptMasterKey(masterKey []byte, derivedKey []byte) ([]byte, error) {
-	c, err := aes.NewCipher(derivedKey)
-	if err != nil {
-		log.Println("could not make cipher")
-		return nil, err
-	}
-	gcm, err := cipher.NewGCM(c)
-	if err != nil {
-		log.Println("could not make gcm")
-		return nil, err
-	}
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		log.Println("could not generate nonce")
-		return nil, err
-	}
-	encryptedMasterKey := gcm.Seal(nonce, nonce, masterKey, nil)
-	return encryptedMasterKey, nil
+func EncryptMasterKey(masterKey []byte, derivedKey []byte) (encryptedMasterKey []byte, err error) {
+	secret.Do(func() {
+		var c cipher.Block
+		c, err = aes.NewCipher(derivedKey)
+		if err != nil {
+			log.Println("could not make cipher")
+			return
+		}
+		var gcm cipher.AEAD
+		gcm, err = cipher.NewGCM(c)
+		if err != nil {
+			log.Println("could not make gcm")
+			return
+		}
+		nonce := make([]byte, gcm.NonceSize())
+		if _, err = io.ReadFull(rand.Reader, nonce); err != nil {
+			log.Println("could not generate nonce")
+			return
+		}
+		encryptedMasterKey = gcm.Seal(nonce, nonce, masterKey, nil)
+	})
+	return encryptedMasterKey, err
 }
 
-func DecryptMasterKey(encryptedMasterKey []byte, derivedKey []byte) ([]byte, error) {
-	c, err := aes.NewCipher(derivedKey)
-	if err != nil {
-		log.Println("could not make cipher")
-		return nil, err
-	}
-	gcm, err := cipher.NewGCM(c)
-	if err != nil {
-		log.Println("could not make gcm")
-		return nil, err
-	}
-	nonceSize := gcm.NonceSize()
-	if len(encryptedMasterKey) < nonceSize {
-		log.Println("ciphertext too short")
-		return nil, fmt.Errorf("ciphertext too short")
-	}
-	nonce, ciphertext := encryptedMasterKey[:nonceSize], encryptedMasterKey[nonceSize:]
-	masterKey, err := gcm.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		log.Println("could not decrypt master key")
-		return nil, err
-	}
-	return masterKey, nil
+func DecryptMasterKey(encryptedMasterKey []byte, derivedKey []byte) (masterKey []byte, err error) {
+	secret.Do(func() {
+		var c cipher.Block
+		c, err = aes.NewCipher(derivedKey)
+		if err != nil {
+			log.Println("could not make cipher")
+			return
+		}
+		var gcm cipher.AEAD
+		gcm, err = cipher.NewGCM(c)
+		if err != nil {
+			log.Println("could not make gcm")
+			return
+		}
+		nonceSize := gcm.NonceSize()
+		if len(encryptedMasterKey) < nonceSize {
+			log.Println("ciphertext too short")
+			err = fmt.Errorf("ciphertext too short")
+			return
+		}
+		nonce, ciphertext := encryptedMasterKey[:nonceSize], encryptedMasterKey[nonceSize:]
+		masterKey, err = gcm.Open(nil, nonce, ciphertext, nil)
+		if err != nil {
+			log.Println("could not decrypt master key")
+			return
+		}
+	})
+	return masterKey, err
 }
 
-func EncryptSecret(secret []byte, masterKey []byte) ([]byte, error) {
-	c, err := aes.NewCipher(masterKey)
-	if err != nil {
-		log.Println("could not make cipher")
-		return nil, err
-	}
-	gcm, err := cipher.NewGCM(c)
-	if err != nil {
-		log.Println("could not make gcm")
-		return nil, err
-	}
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		log.Println("could not generate nonce")
-		return nil, err
-	}
-	encryptedSecret := gcm.Seal(nonce, nonce, secret, nil)
-	return encryptedSecret, nil
+func EncryptSecret(secretData []byte, masterKey []byte) (encryptedSecret []byte, err error) {
+	secret.Do(func() {
+		var c cipher.Block
+		c, err = aes.NewCipher(masterKey)
+		if err != nil {
+			log.Println("could not make cipher")
+			return
+		}
+		var gcm cipher.AEAD
+		gcm, err = cipher.NewGCM(c)
+		if err != nil {
+			log.Println("could not make gcm")
+			return
+		}
+		nonce := make([]byte, gcm.NonceSize())
+		if _, err = io.ReadFull(rand.Reader, nonce); err != nil {
+			log.Println("could not generate nonce")
+			return
+		}
+		encryptedSecret = gcm.Seal(nonce, nonce, secretData, nil)
+	})
+	return encryptedSecret, err
 }
 
-func DecryptSecret(secret []byte, masterKey []byte) ([]byte, error) {
-	c, err := aes.NewCipher(masterKey)
-	if err != nil {
-		log.Println("could not make cipher")
-		return nil, err
-	}
-	gcm, err := cipher.NewGCM(c)
-	if err != nil {
-		log.Println("could not make gcm")
-		return nil, err
-	}
-	nonceSize := gcm.NonceSize()
-	if len(secret) < nonceSize {
-		log.Println("ciphertext too short")
-		return nil, fmt.Errorf("ciphertext too short")
-	}
-	nonce, ciphertext := secret[:nonceSize], secret[nonceSize:]
-	decryptedSecret, err := gcm.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		log.Println("could not decrypt secret")
-		return nil, err
-	}
-	return decryptedSecret, nil
+func DecryptSecret(secretData []byte, masterKey []byte) (decryptedSecret []byte, err error) {
+	secret.Do(func() {
+		var c cipher.Block
+		c, err = aes.NewCipher(masterKey)
+		if err != nil {
+			log.Println("could not make cipher")
+			return
+		}
+		var gcm cipher.AEAD
+		gcm, err = cipher.NewGCM(c)
+		if err != nil {
+			log.Println("could not make gcm")
+			return
+		}
+		nonceSize := gcm.NonceSize()
+		if len(secretData) < nonceSize {
+			log.Println("ciphertext too short")
+			err = fmt.Errorf("ciphertext too short")
+			return
+		}
+		nonce, ciphertext := secretData[:nonceSize], secretData[nonceSize:]
+		decryptedSecret, err = gcm.Open(nil, nonce, ciphertext, nil)
+		if err != nil {
+			log.Println("could not decrypt secret")
+			return
+		}
+	})
+	return decryptedSecret, err
 }
 
 var lockedMemory = make(map[*byte]bool)

@@ -8,10 +8,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"runtime/secret"
 )
 
 const (
-	ChunkSize = 64 * 1024 * 1024 
+	ChunkSize = 64 * 1024 * 1024
 )
 
 type StreamHeader struct {
@@ -19,140 +20,161 @@ type StreamHeader struct {
 	ChunkSize uint32
 }
 
-
-func EncryptStream(reader io.Reader, writer io.Writer, masterKey []byte) (int64, error) {
-	c, err := aes.NewCipher(masterKey)
-	if err != nil {
-		log.Println("could not make cipher")
-		return 0, err
-	}
-	gcm, err := cipher.NewGCM(c)
-	if err != nil {
-		log.Println("could not make gcm")
-		return 0, err
-	}
-
-	header := StreamHeader{
-		Version:   1,
-		ChunkSize: ChunkSize,
-	}
-	if err := binary.Write(writer, binary.LittleEndian, header.Version); err != nil {
-		return 0, fmt.Errorf("failed to write version: %w", err)
-	}
-	if err := binary.Write(writer, binary.LittleEndian, header.ChunkSize); err != nil {
-		return 0, fmt.Errorf("failed to write chunk size: %w", err)
-	}
-
-	var totalBytes int64
-	buffer := make([]byte, ChunkSize)
-	chunkNum := uint64(0)
-
-	for {
-		n, err := io.ReadFull(reader, buffer)
-		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-			return totalBytes, fmt.Errorf("failed to read chunk: %w", err)
+func EncryptStream(reader io.Reader, writer io.Writer, masterKey []byte) (totalBytes int64, err error) {
+	secret.Do(func() {
+		var c cipher.Block
+		c, err = aes.NewCipher(masterKey)
+		if err != nil {
+			log.Println("could not make cipher")
+			return
+		}
+		var gcm cipher.AEAD
+		gcm, err = cipher.NewGCM(c)
+		if err != nil {
+			log.Println("could not make gcm")
+			return
 		}
 
-		if n == 0 {
-			break
+		header := StreamHeader{
+			Version:   1,
+			ChunkSize: ChunkSize,
+		}
+		if err = binary.Write(writer, binary.LittleEndian, header.Version); err != nil {
+			err = fmt.Errorf("failed to write version: %w", err)
+			return
+		}
+		if err = binary.Write(writer, binary.LittleEndian, header.ChunkSize); err != nil {
+			err = fmt.Errorf("failed to write chunk size: %w", err)
+			return
 		}
 
-		nonce := make([]byte, gcm.NonceSize())
-		if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-			return totalBytes, fmt.Errorf("failed to generate nonce: %w", err)
-		}
+		buffer := make([]byte, ChunkSize)
+		chunkNum := uint64(0)
 
-		encryptedChunk := gcm.Seal(nonce, nonce, buffer[:n], nil)
+		for {
+			n, readErr := io.ReadFull(reader, buffer)
+			if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+				err = fmt.Errorf("failed to read chunk: %w", readErr)
+				return
+			}
 
-		if err := binary.Write(writer, binary.LittleEndian, chunkNum); err != nil {
-			return totalBytes, fmt.Errorf("failed to write chunk number: %w", err)
-		}
-
-		chunkLen := uint32(len(encryptedChunk))
-		if err := binary.Write(writer, binary.LittleEndian, chunkLen); err != nil {
-			return totalBytes, fmt.Errorf("failed to write chunk length: %w", err)
-		}
-
-		if _, err := writer.Write(encryptedChunk); err != nil {
-			return totalBytes, fmt.Errorf("failed to write encrypted chunk: %w", err)
-		}
-
-		totalBytes += int64(n)
-		chunkNum++
-
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			break
-		}
-	}
-
-	return totalBytes, nil
-}
-
-func DecryptStream(reader io.Reader, writer io.Writer, masterKey []byte) (int64, error) {
-	c, err := aes.NewCipher(masterKey)
-	if err != nil {
-		log.Println("could not make cipher")
-		return 0, err
-	}
-	gcm, err := cipher.NewGCM(c)
-	if err != nil {
-		log.Println("could not make gcm")
-		return 0, err
-	}
-
-	var version uint8
-	if err := binary.Read(reader, binary.LittleEndian, &version); err != nil {
-		return 0, fmt.Errorf("failed to read version: %w", err)
-	}
-	if version != 1 {
-		return 0, fmt.Errorf("unsupported stream version: %d", version)
-	}
-
-	var chunkSize uint32
-	if err := binary.Read(reader, binary.LittleEndian, &chunkSize); err != nil {
-		return 0, fmt.Errorf("failed to read chunk size: %w", err)
-	}
-
-	var totalBytes int64
-	nonceSize := gcm.NonceSize()
-
-	for {
-		var chunkNum uint64
-		if err := binary.Read(reader, binary.LittleEndian, &chunkNum); err != nil {
-			if err == io.EOF {
+			if n == 0 {
 				break
 			}
-			return totalBytes, fmt.Errorf("failed to read chunk number: %w", err)
-		}
 
-		var encryptedLen uint32
-		if err := binary.Read(reader, binary.LittleEndian, &encryptedLen); err != nil {
-			return totalBytes, fmt.Errorf("failed to read chunk length: %w", err)
-		}
+			nonce := make([]byte, gcm.NonceSize())
+			if _, err = io.ReadFull(rand.Reader, nonce); err != nil {
+				err = fmt.Errorf("failed to generate nonce: %w", err)
+				return
+			}
 
-		encryptedChunk := make([]byte, encryptedLen)
-		if _, err := io.ReadFull(reader, encryptedChunk); err != nil {
-			return totalBytes, fmt.Errorf("failed to read encrypted chunk: %w", err)
-		}
+			encryptedChunk := gcm.Seal(nonce, nonce, buffer[:n], nil)
 
-		if len(encryptedChunk) < nonceSize {
-			return totalBytes, fmt.Errorf("encrypted chunk too short")
-		}
-		nonce, ciphertext := encryptedChunk[:nonceSize], encryptedChunk[nonceSize:]
+			if err = binary.Write(writer, binary.LittleEndian, chunkNum); err != nil {
+				err = fmt.Errorf("failed to write chunk number: %w", err)
+				return
+			}
 
-		plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+			chunkLen := uint32(len(encryptedChunk))
+			if err = binary.Write(writer, binary.LittleEndian, chunkLen); err != nil {
+				err = fmt.Errorf("failed to write chunk length: %w", err)
+				return
+			}
+
+			if _, err = writer.Write(encryptedChunk); err != nil {
+				err = fmt.Errorf("failed to write encrypted chunk: %w", err)
+				return
+			}
+
+			totalBytes += int64(n)
+			chunkNum++
+
+			if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
+				break
+			}
+		}
+	})
+	return totalBytes, err
+}
+
+func DecryptStream(reader io.Reader, writer io.Writer, masterKey []byte) (totalBytes int64, err error) {
+	secret.Do(func() {
+		var c cipher.Block
+		c, err = aes.NewCipher(masterKey)
 		if err != nil {
-			return totalBytes, fmt.Errorf("failed to decrypt chunk %d: %w", chunkNum, err)
+			log.Println("could not make cipher")
+			return
+		}
+		var gcm cipher.AEAD
+		gcm, err = cipher.NewGCM(c)
+		if err != nil {
+			log.Println("could not make gcm")
+			return
 		}
 
-		if _, err := writer.Write(plaintext); err != nil {
-			return totalBytes, fmt.Errorf("failed to write plaintext: %w", err)
+		var version uint8
+		if err = binary.Read(reader, binary.LittleEndian, &version); err != nil {
+			err = fmt.Errorf("failed to read version: %w", err)
+			return
+		}
+		if version != 1 {
+			err = fmt.Errorf("unsupported stream version: %d", version)
+			return
 		}
 
-		totalBytes += int64(len(plaintext))
-	}
+		var chunkSize uint32
+		if err = binary.Read(reader, binary.LittleEndian, &chunkSize); err != nil {
+			err = fmt.Errorf("failed to read chunk size: %w", err)
+			return
+		}
 
-	return totalBytes, nil
+		nonceSize := gcm.NonceSize()
+
+		for {
+			var chunkNum uint64
+			if err = binary.Read(reader, binary.LittleEndian, &chunkNum); err != nil {
+				if err == io.EOF {
+					err = nil
+					break
+				}
+				err = fmt.Errorf("failed to read chunk number: %w", err)
+				return
+			}
+
+			var encryptedLen uint32
+			if err = binary.Read(reader, binary.LittleEndian, &encryptedLen); err != nil {
+				err = fmt.Errorf("failed to read chunk length: %w", err)
+				return
+			}
+
+			encryptedChunk := make([]byte, encryptedLen)
+			if _, err = io.ReadFull(reader, encryptedChunk); err != nil {
+				err = fmt.Errorf("failed to read encrypted chunk: %w", err)
+				return
+			}
+
+			if len(encryptedChunk) < nonceSize {
+				err = fmt.Errorf("encrypted chunk too short")
+				return
+			}
+			nonce, ciphertext := encryptedChunk[:nonceSize], encryptedChunk[nonceSize:]
+
+			var plaintext []byte
+			plaintext, err = gcm.Open(nil, nonce, ciphertext, nil)
+			if err != nil {
+				err = fmt.Errorf("failed to decrypt chunk %d: %w", chunkNum, err)
+				return
+			}
+
+			if _, err = writer.Write(plaintext); err != nil {
+				err = fmt.Errorf("failed to write plaintext: %w", err)
+				return
+			}
+
+			totalBytes += int64(len(plaintext))
+		}
+	})
+	return totalBytes, err
 }
 
 func IsStreamEncrypted(data []byte) bool {
@@ -166,4 +188,3 @@ func IsStreamEncrypted(data []byte) bool {
 	chunkSize := binary.LittleEndian.Uint32(data[1:5])
 	return chunkSize >= 1024*1024 && chunkSize <= 256*1024*1024
 }
-

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime/secret"
 	"sort"
 	"strings"
 	"sync"
@@ -39,69 +40,81 @@ func getActiveVaultContext() (vaultName string, vaultDir string, err error) {
 }
 
 func authenticateVault() (masterKey []byte, vaultDir string, err error) {
-	vaultName, vaultDir, err := getActiveVaultContext()
-	if err != nil {
-		return nil, "", err
-	}
+	secret.Do(func() {
+		var vaultName string
+		vaultName, vaultDir, err = getActiveVaultContext()
+		if err != nil {
+			return
+		}
 
-	password, err := crypto.ReadUserPass()
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to read password: %w", err)
-	}
-	defer crypto.CleanupBytes(password)
+		var password []byte
+		password, err = crypto.ReadUserPass()
+		if err != nil {
+			err = fmt.Errorf("failed to read password: %w", err)
+			return
+		}
+		defer crypto.CleanupBytes(password)
 
-	encryptedMasterKey, salt, err := keyring.LoadVaultKeyring(vaultDir)
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to load keyring: %w", err)
-	}
+		var encryptedMasterKey, salt []byte
+		encryptedMasterKey, salt, err = keyring.LoadVaultKeyring(vaultDir)
+		if err != nil {
+			err = fmt.Errorf("failed to load keyring: %w", err)
+			return
+		}
 
-	// Check if this is a legacy vault (migrated from old system)
-	vaultInfo, err := vaultmanager.GetVaultInfo(vaultName)
-	if err != nil {
-		// Auto-register vault if keyring exists but vault isn't in config (backwards compatibility)
-		if keyring.VaultKeyringExists(vaultDir) {
-			if regErr := vaultmanager.CreateVault(vaultName, vaultmanager.VaultTypeSolo, ""); regErr == nil {
-				vaultInfo, err = vaultmanager.GetVaultInfo(vaultName)
+		// Check if this is a legacy vault (migrated from old system)
+		var vaultInfo *vaultmanager.VaultInfo
+		vaultInfo, err = vaultmanager.GetVaultInfo(vaultName)
+		if err != nil {
+			// Auto-register vault if keyring exists but vault isn't in config (backwards compatibility)
+			if keyring.VaultKeyringExists(vaultDir) {
+				if regErr := vaultmanager.CreateVault(vaultName, vaultmanager.VaultTypeSolo, ""); regErr == nil {
+					vaultInfo, err = vaultmanager.GetVaultInfo(vaultName)
+				}
+			}
+			if err != nil {
+				err = fmt.Errorf("failed to get vault info: %w", err)
+				return
 			}
 		}
-		if err != nil {
-			return nil, "", fmt.Errorf("failed to get vault info: %w", err)
+
+		var derivedKey []byte
+		if vaultInfo.LegacyKeyring {
+			// Use old key derivation (without vault context)
+			derivedKey, _, err = crypto.DeriveKeyFromUserPass([]byte(password), salt)
+		} else {
+			// Use new vault-context key derivation
+			derivedKey, _, err = crypto.DeriveVaultKey([]byte(password), vaultName, salt)
 		}
-	}
 
-	var derivedKey []byte
-	if vaultInfo.LegacyKeyring {
-		// Use old key derivation (without vault context)
-		derivedKey, _, err = crypto.DeriveKeyFromUserPass([]byte(password), salt)
-	} else {
-		// Use new vault-context key derivation
-		derivedKey, _, err = crypto.DeriveVaultKey([]byte(password), vaultName, salt)
-	}
-	
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to derive key: %w", err)
-	}
-	defer crypto.CleanupBytes(derivedKey)
+		if err != nil {
+			err = fmt.Errorf("failed to derive key: %w", err)
+			return
+		}
+		defer crypto.CleanupBytes(derivedKey)
 
-	masterKey, err = crypto.DecryptMasterKey(encryptedMasterKey, derivedKey)
-	if err != nil {
-		storage.RecordFailedAttempt()
-		return nil, "", fmt.Errorf("failed to decrypt master key - incorrect password")
-	}
+		masterKey, err = crypto.DecryptMasterKey(encryptedMasterKey, derivedKey)
+		if err != nil {
+			storage.RecordFailedAttempt()
+			err = fmt.Errorf("failed to decrypt master key - incorrect password")
+			return
+		}
 
-	storage.ResetRateLimit()
-	
-	// Check for master key rotation notification
-	vault, err := storage.LoadVaultFromDir(vaultDir)
-	if err == nil && vault.MasterKeyRotation != nil {
-		fmt.Println()
-		ui.PrintWarning("!", "MASTER KEY WAS ROTATED")
-		ui.PrintMuted(fmt.Sprintf("  rotated at: %s", vault.MasterKeyRotation.RotatedAt.Format("2006-01-02 15:04:05")))
-		ui.PrintMuted(fmt.Sprintf("  rotated by: %s", vault.MasterKeyRotation.RotatedBy))
-		fmt.Println()
-	}
-	
-	return masterKey, vaultDir, nil
+		storage.ResetRateLimit()
+
+		// Check for master key rotation notification
+		var vault *storage.Vault
+		vault, err = storage.LoadVaultFromDir(vaultDir)
+		if err == nil && vault.MasterKeyRotation != nil {
+			fmt.Println()
+			ui.PrintWarning("!", "MASTER KEY WAS ROTATED")
+			ui.PrintMuted(fmt.Sprintf("  rotated at: %s", vault.MasterKeyRotation.RotatedAt.Format("2006-01-02 15:04:05")))
+			ui.PrintMuted(fmt.Sprintf("  rotated by: %s", vault.MasterKeyRotation.RotatedBy))
+			fmt.Println()
+		}
+	})
+
+	return masterKey, vaultDir, err
 }
 
 func main() {
@@ -174,7 +187,7 @@ func runInteractiveMode() {
 			// Check if active vault is initialized and prevent mode switching
 			activeVault, _ := vaultmanager.GetActiveVault()
 			vaultDir := vaultmanager.GetVaultDir(activeVault)
-			
+
 			// Check if vault is initialized as solo
 			if keyring.VaultKeyringExists(vaultDir) {
 				vaultInfo, err := vaultmanager.GetVaultInfo(activeVault)
@@ -191,7 +204,7 @@ func runInteractiveMode() {
 					}
 				}
 			}
-			
+
 			useGroupVault = !useGroupVault
 			if useGroupVault {
 				ui.PrintSuccess("+", "switched to GROUP vault mode")
@@ -468,7 +481,7 @@ func secretsInit(useGroups bool) error {
 	if keyring.VaultKeyringExists(vaultDir) {
 		return fmt.Errorf("vault '%s' is already initialized", activeVault)
 	}
-	
+
 	// Check if multiuser vault exists for group vaults
 	if useGroups {
 		isMultiUser, _ := multiuser.IsMultiUserModeInDir(vaultDir)
@@ -482,7 +495,7 @@ func secretsInit(useGroups bool) error {
 	if err != nil {
 		return fmt.Errorf("failed to check vault existence: %w", err)
 	}
-	
+
 	// Check vault type matches initialization mode
 	if exists {
 		vaultInfo, err := vaultmanager.GetVaultInfo(activeVault)
@@ -495,7 +508,7 @@ func secretsInit(useGroups bool) error {
 			}
 		}
 	}
-	
+
 	if !exists {
 		vaultType := vaultmanager.VaultTypeSolo
 		if useGroups {
@@ -633,7 +646,7 @@ func secretsAdd() error {
 	if err != nil {
 		return fmt.Errorf("failed to encrypt secret")
 	}
-	
+
 	secretName, err := crypto.ReadSecretName()
 	if err != nil {
 		return fmt.Errorf("failed to read secret name")
@@ -783,7 +796,7 @@ func secretsAddFromFile(filePath string) error {
 		// Convert to hex
 		encryptedBytes := []byte(encryptedBuf.String())
 		encryptedValue = fmt.Sprintf("%x", encryptedBytes)
-		
+
 		ui.PrintSuccess("+", "file encrypted successfully")
 		fmt.Println()
 	} else {
@@ -931,7 +944,7 @@ func secretsAddFromFolder(folderPath string) error {
 	ui.PrintPrompt("enter a name for this folder backup: ")
 	var folderName string
 	fmt.Scanln(&folderName)
-	
+
 	if folderName == "" {
 		return fmt.Errorf("folder name cannot be empty")
 	}
@@ -1002,7 +1015,7 @@ func secretsAddFromFolder(folderPath string) error {
 			var encryptedBuf strings.Builder
 			_, err = crypto.EncryptStream(file, &encryptedBuf, masterKey)
 			file.Close()
-			
+
 			if err != nil {
 				ui.PrintError("x", fmt.Sprintf("  %d/%d: %s - encryption failed", i+1, len(files), relPath))
 				failCount++
@@ -2268,10 +2281,10 @@ func vaultInfo() error {
 	ui.PrintMuted(fmt.Sprintf("  type: %s", info.Type))
 	ui.PrintMuted(fmt.Sprintf("  description: %s", info.Description))
 	ui.PrintMuted(fmt.Sprintf("  created: %s", info.CreatedAt.Format("2006-01-02 15:04:05")))
-	
+
 	vaultDir := vaultmanager.GetVaultDir(activeVault)
 	ui.PrintMuted(fmt.Sprintf("  location: %s", vaultDir))
-	
+
 	initialized := keyring.VaultKeyringExists(vaultDir)
 	if initialized {
 		ui.PrintMuted("  status: initialized")
@@ -2280,7 +2293,7 @@ func vaultInfo() error {
 		fmt.Println()
 		ui.PrintTip("tip: use 'secrets init' to initialize this vault")
 	}
-	
+
 	fmt.Println()
 	return nil
 }
@@ -2347,16 +2360,13 @@ func secretsRestore(args []string) error {
 		return fmt.Errorf("secret '%s' not found", secretName)
 	}
 
-
 	encryptedBytes := make([]byte, len(metadata.EncryptedValue)/2)
 	_, err = fmt.Sscanf(metadata.EncryptedValue, "%x", &encryptedBytes)
 	if err != nil {
 		return fmt.Errorf("failed to decode secret: %w", err)
 	}
 
-
 	isStreamed := crypto.IsStreamEncrypted(encryptedBytes)
-
 
 	if outputPath == "" {
 		ui.PrintPrompt("enter output path (or press Enter for current directory): ")
@@ -2364,7 +2374,6 @@ func secretsRestore(args []string) error {
 		if scanner.Scan() {
 			outputPath = strings.TrimSpace(scanner.Text())
 		}
-
 
 		if outputPath == "" {
 			cwd, err := os.Getwd()
@@ -2379,7 +2388,6 @@ func secretsRestore(args []string) error {
 		}
 	}
 
-
 	if _, err := os.Stat(outputPath); err == nil {
 		ui.PrintWarning("!", fmt.Sprintf("file already exists: %s", outputPath))
 		ui.PrintPrompt("overwrite? (yes/no): ")
@@ -2392,13 +2400,11 @@ func secretsRestore(args []string) error {
 		}
 	}
 
-
 	var bytesWritten int64
-	
+
 	if isStreamed {
 		ui.PrintInfo(">", "decrypting streamed file...")
 		fmt.Println()
-		
 
 		outFile, err := os.OpenFile(outputPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 		if err != nil {
@@ -2407,9 +2413,7 @@ func secretsRestore(args []string) error {
 		}
 		defer outFile.Close()
 
-
 		encryptedReader := strings.NewReader(string(encryptedBytes))
-		
 
 		bytesWritten, err = crypto.DecryptStream(encryptedReader, outFile, masterKey)
 		if err != nil {
@@ -2425,7 +2429,6 @@ func secretsRestore(args []string) error {
 		}
 		crypto.SecureBytes(secret)
 		defer crypto.CleanupBytes(secret)
-
 
 		if err := os.WriteFile(outputPath, secret, 0600); err != nil {
 			audit.LogEventForVault(vaultDir, currentUsername, "restore", secretName, false, err.Error(), masterKey)
@@ -2535,7 +2538,7 @@ func secretsRestoreFolder(folderName string, outputPath string) error {
 	for i, secretName := range folderSecrets {
 		relPath := strings.TrimPrefix(secretName, prefix)
 		relPath = filepath.FromSlash(relPath)
-		
+
 		fullOutputPath := filepath.Join(outputPath, relPath)
 
 		if useGroupVault {
@@ -2689,7 +2692,7 @@ func secretsWipeFile(filePath string) error {
 
 	for pass := 1; pass <= 3; pass++ {
 		ui.PrintMuted(fmt.Sprintf("  pass %d/3...", pass))
-		
+
 		if _, err := file.Seek(0, 0); err != nil {
 			return fmt.Errorf("failed to seek file: %w", err)
 		}
@@ -2916,7 +2919,6 @@ func secretsImportPasswords(csvFile string) error {
 	}
 
 	ui.PrintSuccess("+", fmt.Sprintf("found %d password(s) in CSV", len(entries)))
-	
 
 	siteCounts := importer.DetectDuplicateSites(entries)
 	duplicateCount := 0
@@ -2925,12 +2927,11 @@ func secretsImportPasswords(csvFile string) error {
 			duplicateCount++
 		}
 	}
-	
+
 	if duplicateCount > 0 {
 		ui.PrintWarning("!", fmt.Sprintf("detected %d site(s) with multiple credentials - will append username to secret name", duplicateCount))
 	}
 	fmt.Println()
-
 
 	ui.PrintInfo("*", "preview of entries to import:")
 	fmt.Println()
@@ -2950,7 +2951,6 @@ func secretsImportPasswords(csvFile string) error {
 	}
 	fmt.Println()
 
-
 	ui.PrintWarning("!", "this will add all passwords as individual secrets to your vault")
 	ui.PrintPrompt("continue? (yes/no): ")
 	var confirm string
@@ -2963,7 +2963,6 @@ func secretsImportPasswords(csvFile string) error {
 
 	fmt.Println()
 
-
 	masterKey, vaultDir, err := authenticateVault()
 	if err != nil {
 		return err
@@ -2975,11 +2974,9 @@ func secretsImportPasswords(csvFile string) error {
 		return fmt.Errorf("failed to load vault: %w", err)
 	}
 
-
 	siteCounts = importer.DetectDuplicateSites(entries)
 
 	nameCount := make(map[string]int)
-
 
 	ui.PrintInfo(">", "importing passwords...")
 	fmt.Println()
@@ -2990,9 +2987,9 @@ func secretsImportPasswords(csvFile string) error {
 	for i, entry := range entries {
 		baseName := importer.FormatSecretName(entry, 0, false)
 		includeUsername := siteCounts[baseName] > 1
-		
+
 		secretName := importer.FormatSecretName(entry, 0, includeUsername)
-		
+
 		if _, exists := vault.SecretsMetadata[secretName]; exists {
 			count := nameCount[secretName]
 			secretName = importer.FormatSecretName(entry, count, includeUsername)
@@ -3018,11 +3015,9 @@ func secretsImportPasswords(csvFile string) error {
 			}
 		}
 
-
 		secretValue := importer.FormatSecretValue(entry)
 		secretBytes := []byte(secretValue)
 		crypto.SecureBytes(secretBytes)
-
 
 		encryptedSecret, err := crypto.EncryptSecret(secretBytes, masterKey)
 		crypto.CleanupBytes(secretBytes)
@@ -3031,7 +3026,6 @@ func secretsImportPasswords(csvFile string) error {
 			failCount++
 			continue
 		}
-
 
 		now := time.Now()
 		existing, exists := vault.SecretsMetadata[secretName]
@@ -3054,7 +3048,6 @@ func secretsImportPasswords(csvFile string) error {
 		successCount++
 	}
 
-
 	if err := storage.SaveVaultToDir(vaultDir, vault); err != nil {
 		return fmt.Errorf("failed to save vault: %w", err)
 	}
@@ -3072,5 +3065,3 @@ func secretsImportPasswords(csvFile string) error {
 
 	return nil
 }
-
-

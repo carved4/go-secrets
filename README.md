@@ -1,5 +1,7 @@
 # go-secrets
 
+> **EXPERIMENTAL BRANCH**: This branch uses Go 1.26's experimental `runtime/secret` package for enhanced memory security. See [Installation](#installation) for setup instructions.
+
 a secure, local-first secrets management tool for developers
 
 ## why i made this
@@ -45,11 +47,41 @@ secrets manager stores your sensitive data (api keys, tokens, passwords, connect
 
 ## installation
 
-requires go 1.24 or later.
+### experimental branch (runtime/secret support)
+
+this branch requires **go 1.26rc1 or later** and the `runtimesecret` experiment enabled.
+
+#### step 1: install go 1.26rc1
 
 ```bash
-go install github.com/carved4/go-secrets/cmd/secrets@latest
+go install golang.org/dl/go1.26rc1@latest
+go1.26rc1 download
 ```
+
+#### step 2: build with the runtimesecret experiment
+
+```bash
+git clone https://github.com/carved4/go-secrets.git
+cd go-secrets
+GOEXPERIMENT=runtimesecret go1.26rc1 build -o secrets ./cmd/secrets
+sudo mv secrets /usr/local/bin/  # or your preferred location
+```
+
+#### what does runtime/secret do?
+
+the `runtime/secret` package ensures that sensitive data is erased from memory in a timely manner:
+- **registers** used by cryptographic functions are cleared before returning
+- **stack** memory is erased immediately after use
+- **heap allocations** are zeroed when garbage collected
+- works even if functions panic or call `runtime.Goexit`
+
+this provides defense-in-depth against memory disclosure attacks, core dumps, and other scenarios where sensitive data might leak from process memory.
+
+**note**: currently only supported on linux/amd64 and linux/arm64. on other platforms, the code runs normally without the enhanced memory clearing.
+
+### standard installation (without runtime/secret)
+
+for the stable version without experimental features, see the main branch.
 
 on windows, run as administrator. on linux/macos, run with sudo.
 
